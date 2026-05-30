@@ -2920,10 +2920,10 @@ func (m AppModel) viewConfigPhase1() string {
 		sb.WriteString(styleNormal.Render("  Probing IPs from ips.txt on the selected ports...\n\n"))
 	} else if strings.TrimSpace(m.configURL) == "" {
 		sb.WriteString(styleNormal.Render(fitLine(fmt.Sprintf("  Scanning random %s IPv4 IPs (standard HTTP probe)...", m.currentProviderName()), contentWidth)) + "\n")
-		sb.WriteString(styleDim.Render(fitLine("  Neighbor scan: healthy hits explore nearby addresses.", contentWidth)) + "\n\n")
+		sb.WriteString(styleDim.Render(fitLine("  Neighbor scan: healthy hits explore nearby addresses within the target budget.", contentWidth)) + "\n\n")
 	} else {
 		sb.WriteString(styleNormal.Render(fitLine(fmt.Sprintf("  Scanning %s IPs using config probe settings...", m.currentProviderName()), contentWidth)) + "\n")
-		sb.WriteString(styleDim.Render(fitLine("  Neighbor scan: healthy hits explore nearby addresses.", contentWidth)) + "\n\n")
+		sb.WriteString(styleDim.Render(fitLine("  Neighbor scan: healthy hits explore nearby addresses within the target budget.", contentWidth)) + "\n\n")
 	}
 
 	if m.liveResultPath != "" {

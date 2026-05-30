@@ -1,11 +1,15 @@
 package ui
 
 import (
+	"context"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/matinsenpai/senpaiscanner/internal/prober"
 	"github.com/matinsenpai/senpaiscanner/internal/provider"
+	"github.com/matinsenpai/senpaiscanner/internal/result"
 )
 
 func TestConfigProbeFromURLUsesConfigPortSNIAndWebSocket(t *testing.T) {
@@ -61,5 +65,66 @@ func TestDefaultPhase1ProbeConfigKeepsCloudFrontHTTPValidation(t *testing.T) {
 	}
 	if cfg.SNI != provider.DefaultHTTPHost(provider.CloudFront) {
 		t.Fatalf("SNI = %q, want default CloudFront host", cfg.SNI)
+	}
+}
+
+func TestRunConfigPortProbesCapsNeighborExpansion(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		<-done
+	})
+
+	port := ln.Addr().(*net.TCPAddr).Port
+	ips := make(chan net.IP, 1)
+	ips <- net.ParseIP("127.0.0.1")
+	close(ips)
+	_, loopbackNet, err := net.ParseCIDR("127.0.0.0/30")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var callbacks int64
+	runConfigPortProbes(
+		context.Background(),
+		ips,
+		[]int{port},
+		4,
+		prober.Config{
+			Port:     port,
+			Provider: provider.Cloudflare,
+			Mode:     prober.ModeTCP,
+			Tries:    1,
+			Timeout:  100 * time.Millisecond,
+		},
+		func(_ *result.Result) {
+			atomic.AddInt64(&callbacks, 1)
+		},
+		neighborScanOpts{
+			enabled:  true,
+			nets:     []*net.IPNet{loopbackNet},
+			radius:   2,
+			perHit:   2,
+			maxTotal: 2,
+		},
+		1,
+	)
+
+	if got := atomic.LoadInt64(&callbacks); got != 1 {
+		t.Fatalf("callbacks = %d, want 1", got)
 	}
 }

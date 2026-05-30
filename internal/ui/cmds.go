@@ -366,7 +366,11 @@ func runConfigPhase1(opts configPhase1Options) {
 			maxTotal: ipsrc.DefaultNeighborMaxTotal,
 		}
 	}
-	runConfigPortProbes(ctx, ipStream, ports, opts.concurrency, probeCfg, callback, neighbor)
+	maxProbes := 0
+	if !opts.fromFile {
+		maxProbes = opts.count * len(ports)
+	}
+	runConfigPortProbes(ctx, ipStream, ports, opts.concurrency, probeCfg, callback, neighbor, maxProbes)
 
 	if prog != nil {
 		prog.Send(ConfigPhase1DoneMsg{})
@@ -387,7 +391,7 @@ type neighborScanOpts struct {
 	maxTotal int
 }
 
-func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, concurrency int, base prober.Config, callback func(*result.Result), neighbor neighborScanOpts) {
+func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, concurrency int, base prober.Config, callback func(*result.Result), neighbor neighborScanOpts, maxProbes int) {
 	if concurrency <= 0 {
 		concurrency = 50
 	}
@@ -407,10 +411,20 @@ func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, co
 	var pending int64
 	var neighborsQueued int64
 	seen := make(map[string]struct{})
+	submitted := 0
 	var seenMu sync.Mutex
 
 	jobKey := func(ip net.IP, port int) string {
 		return fmt.Sprintf("%s:%d", ip.String(), port)
+	}
+
+	atProbeLimit := func() bool {
+		if maxProbes <= 0 {
+			return false
+		}
+		seenMu.Lock()
+		defer seenMu.Unlock()
+		return submitted >= maxProbes
 	}
 
 	submit := func(ip net.IP, port int) bool {
@@ -420,7 +434,12 @@ func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, co
 			seenMu.Unlock()
 			return false
 		}
+		if maxProbes > 0 && submitted >= maxProbes {
+			seenMu.Unlock()
+			return false
+		}
 		seen[key] = struct{}{}
+		submitted++
 		seenMu.Unlock()
 
 		atomic.AddInt64(&pending, 1)
@@ -497,6 +516,9 @@ func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, co
 
 		for ip := range ips {
 			if ctx.Err() != nil {
+				return
+			}
+			if atProbeLimit() {
 				return
 			}
 			enqueueIP(ip)
