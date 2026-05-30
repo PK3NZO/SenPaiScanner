@@ -235,6 +235,17 @@ func TestWorkingEndpointsIncludePorts(t *testing.T) {
 	}
 }
 
+func TestWorkingValidationDetailsIncludesMetrics(t *testing.T) {
+	got := workingValidationDetails([]*xraytest.ValidationResult{
+		{IP: "104.18.1.1", Port: 443, Transport: "ws", Throughput: 1.25 * 1024 * 1024, Latency: 250 * time.Millisecond, Success: true},
+		{IP: "104.18.1.2", Port: 443, Transport: "ws", Success: false},
+	})
+	want := "endpoint,type,speed,latency,status\n104.18.1.1:443,ws,10.5 Mbps,250ms,ok\n"
+	if got != want {
+		t.Fatalf("details = %q, want %q", got, want)
+	}
+}
+
 func TestGenericScanCopyDoesNotExportHealthyIPs(t *testing.T) {
 	m := AppModel{page: PageResults}
 	next, _ := m.handleResultsKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})

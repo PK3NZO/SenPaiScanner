@@ -1058,7 +1058,7 @@ func (m AppModel) copyWorkingIPs() string {
 	if len(endpoints) == 0 {
 		return "no working endpoints to copy"
 	}
-	return copyAndSaveIPs(endpoints)
+	return copyValidationDetailsAndSaveEndpoints(m.configResults, endpoints)
 }
 
 func workingIPs(results []*xraytest.ValidationResult) []string {
@@ -1080,6 +1080,31 @@ func workingEndpoints(results []*xraytest.ValidationResult) []string {
 		endpoints = append(endpoints, endpoint)
 	}
 	return endpoints
+}
+
+func workingValidationDetails(results []*xraytest.ValidationResult) string {
+	var sb strings.Builder
+	sb.WriteString("endpoint,type,speed,latency,status\n")
+	seen := make(map[string]struct{})
+	for _, r := range results {
+		if r == nil || !r.Success || r.IP == "" {
+			continue
+		}
+		endpoint := formatEndpoint(r.IP, r.Port)
+		if _, ok := seen[endpoint]; ok {
+			continue
+		}
+		seen[endpoint] = struct{}{}
+		sb.WriteString(endpoint)
+		sb.WriteRune(',')
+		sb.WriteString(r.Transport)
+		sb.WriteRune(',')
+		sb.WriteString(formatValidationSpeed(r.Throughput))
+		sb.WriteRune(',')
+		sb.WriteString(formatValidationLatency(r.Latency))
+		sb.WriteString(",ok\n")
+	}
+	return sb.String()
 }
 
 func formatEndpoint(ip string, port int) string {
@@ -1175,6 +1200,22 @@ func copyAndSaveIPs(ips []string) string {
 		return fmt.Sprintf("clipboard failed; saved %d working endpoints to %s", len(ips), path)
 	case clipErr == nil && fileErr != nil:
 		return fmt.Sprintf("copied %d working endpoints; save failed: %v", len(ips), fileErr)
+	default:
+		return fmt.Sprintf("copy failed: %v; save failed: %v", clipErr, fileErr)
+	}
+}
+
+func copyValidationDetailsAndSaveEndpoints(results []*xraytest.ValidationResult, endpoints []string) string {
+	clipErr := clipboardWriteAll(workingValidationDetails(results))
+	path, fileErr := writeIPsBesideExecutable(endpoints)
+
+	switch {
+	case clipErr == nil && fileErr == nil:
+		return fmt.Sprintf("copied details for %d working endpoints; saved endpoints to %s", len(endpoints), path)
+	case clipErr != nil && fileErr == nil:
+		return fmt.Sprintf("clipboard failed; saved %d working endpoints to %s", len(endpoints), path)
+	case clipErr == nil && fileErr != nil:
+		return fmt.Sprintf("copied details for %d working endpoints; save failed: %v", len(endpoints), fileErr)
 	default:
 		return fmt.Sprintf("copy failed: %v; save failed: %v", clipErr, fileErr)
 	}
