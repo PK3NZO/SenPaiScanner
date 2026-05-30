@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,6 +12,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/matinsenpai/senpaiscanner/internal/result"
 	"github.com/matinsenpai/senpaiscanner/internal/xraytest"
 )
 
@@ -58,6 +61,35 @@ func TestFindWorkingIPsMenuOpensUnifiedConfigFlow(t *testing.T) {
 	}
 	if got.configSetupRow != 0 || got.configOptionalRow != 0 {
 		t.Fatalf("config rows = (%d,%d), want (0,0)", got.configSetupRow, got.configOptionalRow)
+	}
+}
+
+func TestConfigPhase1ViewStaysWithinTerminalHeight(t *testing.T) {
+	m := NewApp("test")
+	m.page = PageConfigPhase1
+	m.width = 120
+	m.height = 30
+	m.configURL = "vless://redacted"
+	m.liveResultPath = "/Users/pouriarc/Projects/SenPaiScanner/SenPaiScannerResult-20260530-193925.txt"
+	for i := 0; i < 30; i++ {
+		m.configPhase1Results = append(m.configPhase1Results, &result.Result{
+			IP:           net.ParseIP(fmt.Sprintf("23.228.222.%d", i+1)),
+			Port:         443,
+			Provider:     "cloudfront",
+			ProbeMode:    "tls",
+			Latencies:    []time.Duration{150 * time.Millisecond},
+			TLSOk:        true,
+			VerifiedHTTP: true,
+		})
+	}
+
+	view := m.viewConfigPhase1()
+	lines := strings.Split(strings.TrimSuffix(view, "\n"), "\n")
+	if len(lines) > m.height {
+		t.Fatalf("view lines = %d, want <= %d\n%s", len(lines), m.height, view)
+	}
+	if strings.Contains(view, "/Users/pouriarc/Projects") {
+		t.Fatalf("view should render compact live path:\n%s", view)
 	}
 }
 

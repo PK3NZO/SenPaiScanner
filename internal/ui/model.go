@@ -1089,6 +1089,16 @@ func formatEndpoint(ip string, port int) string {
 	return fmt.Sprintf("%s:%d", ip, port)
 }
 
+func fitLine(s string, width int) string {
+	if width <= 0 || len(s) <= width {
+		return s
+	}
+	if width <= 1 {
+		return s[:width]
+	}
+	return s[:width-1] + "…"
+}
+
 func formatValidationSpeed(throughput float64) string {
 	if throughput <= 0 {
 		return "n/a"
@@ -2826,9 +2836,10 @@ type ConfigPhase1DoneMsg struct{}
 
 func (m AppModel) viewConfigPhase1() string {
 	var sb strings.Builder
+	contentWidth := minInt(maxInt(m.width-4, 40), 96)
 
 	sb.WriteString(styleTitle.Render("\n  ⚡  Phase 1 — Finding reachable IPs\n"))
-	sb.WriteString(fmt.Sprintf("%s\n\n", styleSep.Render("  "+strings.Repeat("─", minInt(m.width-4, 70)))))
+	sb.WriteString(fmt.Sprintf("%s\n\n", styleSep.Render("  "+strings.Repeat("─", minInt(contentWidth, 70)))))
 
 	icon := m.spinner.View()
 	if m.configPhase1Done {
@@ -2867,15 +2878,15 @@ func (m AppModel) viewConfigPhase1() string {
 	} else if m.configIPMode == 1 {
 		sb.WriteString(styleNormal.Render("  Probing IPs from ips.txt on the selected ports...\n\n"))
 	} else if strings.TrimSpace(m.configURL) == "" {
-		sb.WriteString(styleNormal.Render(fmt.Sprintf("  Scanning random %s IPv4 IPs (standard HTTP probe)...\n", m.currentProviderName())))
-		sb.WriteString(styleDim.Render(fmt.Sprintf("  healthy hits also explore nearby addresses in the same %s block\n\n", m.currentProviderName())))
+		sb.WriteString(styleNormal.Render(fitLine(fmt.Sprintf("  Scanning random %s IPv4 IPs (standard HTTP probe)...", m.currentProviderName()), contentWidth)) + "\n")
+		sb.WriteString(styleDim.Render(fitLine("  Neighbor scan: healthy hits explore nearby addresses.", contentWidth)) + "\n\n")
 	} else {
-		sb.WriteString(styleNormal.Render(fmt.Sprintf("  Scanning %s IPs using your config probe settings...\n", m.currentProviderName())))
-		sb.WriteString(styleDim.Render(fmt.Sprintf("  healthy hits also explore nearby addresses in the same %s block\n\n", m.currentProviderName())))
+		sb.WriteString(styleNormal.Render(fitLine(fmt.Sprintf("  Scanning %s IPs using config probe settings...", m.currentProviderName()), contentWidth)) + "\n")
+		sb.WriteString(styleDim.Render(fitLine("  Neighbor scan: healthy hits explore nearby addresses.", contentWidth)) + "\n\n")
 	}
 
 	if m.liveResultPath != "" {
-		sb.WriteString(styleDim.Render("  live results → " + m.liveResultPath + "\n\n"))
+		sb.WriteString(styleDim.Render(fitLine("  live results -> "+filepath.Base(m.liveResultPath), contentWidth)) + "\n\n")
 	}
 
 	if len(m.configPhase1Results) > 0 {
@@ -2883,7 +2894,14 @@ func (m AppModel) viewConfigPhase1() string {
 			"ENDPOINT", "LOSS", "AVG(ms)", "COLO", "STATUS")
 		sb.WriteString(fmt.Sprintf("%s\n%s\n", styleHeader.Render(hdr), styleSep.Render("  "+strings.Repeat("─", 64))))
 
-		top := result.TopN(m.configPhase1Results, 20)
+		maxRows := m.height - 13
+		if maxRows < 3 {
+			maxRows = 3
+		}
+		if maxRows > 12 {
+			maxRows = 12
+		}
+		top := result.TopN(m.configPhase1Results, maxRows)
 		for _, r := range top {
 			colo := r.Colo
 			if colo == "" {
@@ -2899,6 +2917,9 @@ func (m AppModel) viewConfigPhase1() string {
 				formatEndpoint(r.IP.String(), r.Port), r.Loss(),
 				float64(r.Avg().Milliseconds()), colo, status)
 			sb.WriteString(lineStyle.Render(line) + "\n")
+		}
+		if healthy > len(top) {
+			sb.WriteString(styleDim.Render(fmt.Sprintf("  showing top %d of %d healthy endpoints\n", len(top), healthy)))
 		}
 		sb.WriteRune('\n')
 	}
