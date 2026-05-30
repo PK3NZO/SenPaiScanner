@@ -12,9 +12,22 @@ import (
 )
 
 func TestLiveResultFileNameFormat(t *testing.T) {
+	dir := t.TempDir()
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWD) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
 	path, err := liveResultFilePath()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got := filepath.Base(filepath.Dir(path)); got != "results" {
+		t.Fatalf("dir = %q, want results", got)
 	}
 	base := filepath.Base(path)
 	if !strings.HasPrefix(base, "SenPaiScannerResult-") {
@@ -39,6 +52,9 @@ func TestLiveResultWriterRewritesHealthyPhase1Rows(t *testing.T) {
 	w, path, err := newLiveResultWriter(false)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got := filepath.Base(filepath.Dir(path)); got != "results" {
+		t.Fatalf("dir = %q, want results", got)
 	}
 	w.AddPhase1(&result.Result{
 		IP:           net.ParseIP("104.18.1.1"),

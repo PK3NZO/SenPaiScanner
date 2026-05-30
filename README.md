@@ -123,7 +123,7 @@ Press **Enter** on the last row to continue to the optional config step.
 
 **Enter** with an empty config field starts a connectivity-only scan. Paste a URL, set **Top N**, then **Enter** again to run full validation.
 
-**Live results file:** every scan writes (and keeps updating) `SenPaiScannerResult-YYYYMMDD-HHMMSS.txt` next to the binary or in the working directory. Open it in any editor while the scan runs to watch results arrive.
+**Live results file:** every scan writes (and keeps updating) `results/SenPaiScannerResult-YYYYMMDD-HHMMSS.txt`. Open it in any editor while the scan runs to watch results arrive.
 
 ### Setup details
 

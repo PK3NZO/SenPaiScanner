@@ -54,35 +54,24 @@ func newLiveResultWriter(withConfig bool) (*LiveResultWriter, string, error) {
 
 func liveResultFilePath() (string, error) {
 	name := fmt.Sprintf("SenPaiScannerResult-%s.txt", time.Now().Format("20060102-150405"))
-	for _, dir := range resultFileDirs() {
-		if dir == "" {
-			continue
-		}
-		return filepath.Join(dir, name), nil
+	dir, err := resultsDir()
+	if err != nil {
+		return "", err
 	}
-	return name, nil
+	return filepath.Join(dir, name), nil
 }
 
-func resultFileDirs() []string {
-	seen := make(map[string]struct{})
-	var dirs []string
-	add := func(dir string) {
-		if dir == "" {
-			return
-		}
-		if _, ok := seen[dir]; ok {
-			return
-		}
-		seen[dir] = struct{}{}
-		dirs = append(dirs, dir)
-	}
+func resultsDir() (string, error) {
 	if wd, err := os.Getwd(); err == nil {
-		add(wd)
+		dir := filepath.Join(wd, "results")
+		return dir, os.MkdirAll(dir, 0o755)
 	}
 	if exe, err := os.Executable(); err == nil {
-		add(filepath.Dir(exe))
+		dir := filepath.Join(filepath.Dir(exe), "results")
+		return dir, os.MkdirAll(dir, 0o755)
 	}
-	return dirs
+	dir := "results"
+	return dir, os.MkdirAll(dir, 0o755)
 }
 
 func (w *LiveResultWriter) AddPhase1(r *result.Result) {
