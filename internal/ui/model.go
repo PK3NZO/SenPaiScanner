@@ -17,6 +17,7 @@ import (
 
 	"github.com/matinsenpai/senpaiscanner/internal/banner"
 	"github.com/matinsenpai/senpaiscanner/internal/config"
+	"github.com/matinsenpai/senpaiscanner/internal/debuglog"
 	"github.com/matinsenpai/senpaiscanner/internal/provider"
 	"github.com/matinsenpai/senpaiscanner/internal/result"
 	"github.com/matinsenpai/senpaiscanner/internal/runlog"
@@ -257,8 +258,10 @@ type AppModel struct {
 	liveResultPath      string
 
 	// shared
-	statusMsg string
-	version   string
+	statusMsg        string
+	version          string
+	debugMode        bool
+	restartRequested bool
 }
 
 type menuEntry struct {
@@ -268,6 +271,7 @@ type menuEntry struct {
 
 var menuEntries = []menuEntry{
 	{"Find Working IPs", "scan Cloudflare IPs — config optional"},
+	{"Debug Mode", "toggle diagnostic logging and restart"},
 	{"About", ""},
 	{"Quit", ""},
 }
@@ -276,8 +280,9 @@ const menuLabelWidth = 16
 
 const (
 	menuFindWorking = 0
-	menuAbout       = 1
-	menuQuit        = 2
+	menuDebugMode   = 1
+	menuAbout       = 2
+	menuQuit        = 3
 )
 
 var modes = []string{"tls", "tcp", "http"}
@@ -286,7 +291,7 @@ var modes = []string{"tls", "tcp", "http"}
 // Constructor
 // ---------------------------------------------------------------------------
 
-func NewApp(version string) AppModel {
+func NewApp(version string, debugMode ...bool) AppModel {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#F6821F"))
@@ -302,6 +307,7 @@ func NewApp(version string) AppModel {
 		scanCfg:          defaultScanConfig(),
 		selectedProvider: provider.Normalize(config.ScanDefaults.Provider),
 		version:          version,
+		debugMode:        len(debugMode) > 0 && debugMode[0],
 		width:            120,
 		height:           40,
 		scanStarted:      time.Now(),
@@ -327,6 +333,14 @@ func NewApp(version string) AppModel {
 	m.modeIdx = modeIndex(m.scanCfg.Mode)
 	m.buildFormInputs()
 	return m
+}
+
+func (m AppModel) RestartRequested() bool {
+	return m.restartRequested
+}
+
+func (m AppModel) DebugMode() bool {
+	return m.debugMode
 }
 
 func modeIndex(mode string) int {
@@ -386,6 +400,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		debuglog.Printf("window_size width=%d height=%d page=%s", msg.Width, msg.Height, pageName(m.page))
 		return m, nil
 
 	case tickMsg:
@@ -418,12 +433,14 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ErrorMsg:
 		if msg.ScanID == m.activeScanID {
 			m.statusMsg = msg.Text
+			debuglog.Printf("scan_error scan_id=%d text=%q", msg.ScanID, msg.Text)
 		}
 		return m, nil
 
 	case DoneMsg:
 		if msg.ScanID == m.activeScanID {
 			m.scanDone = true
+			debuglog.Printf("scan_done scan_id=%d results=%d tested=%d healthy=%d", msg.ScanID, len(m.scanResults), m.scanStats.Tested, m.scanStats.Healthy)
 		}
 		return m, nil
 
@@ -436,6 +453,10 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ConfigProgressMsg:
 		m.configResults = append(m.configResults, msg.Result)
 		m.configTotal = msg.Total
+		if msg.Result != nil {
+			debuglog.Printf("config_phase2_result done=%d total=%d endpoint=%s success=%t transport=%s latency_ms=%d throughput=%.0f error=%q",
+				msg.Done, msg.Total, formatEndpoint(msg.Result.IP, msg.Result.Port), msg.Result.Success, msg.Result.Transport, msg.Result.Latency.Milliseconds(), msg.Result.Throughput, msg.Result.Error)
+		}
 		if m.configLogSession != nil {
 			if err := m.configLogSession.AppendPhase2Result(msg.Result); err != nil {
 				m.statusMsg = fmt.Sprintf("results save error: %v", err)
@@ -446,6 +467,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ConfigDoneMsg:
 		m.configScanning = false
 		m.configDone = true
+		debuglog.Printf("config_phase2_done total=%d success=%d fail=%d", len(m.configResults), m.configSuccessCount(), m.configFailCount())
 		return m, nil
 
 	case ConfigPhase1ResultMsg:
@@ -462,10 +484,12 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		clearLiveResultWriter()
 		m.page = PageScanWithConfig
 		m.statusMsg = msg.Err
+		debuglog.Printf("config_phase1_error error=%q", msg.Err)
 		return m, nil
 
 	case ConfigPhase1DoneMsg:
 		m.configPhase1Done = true
+		debuglog.Printf("config_phase1_done_ui results=%d healthy=%d phase1_only=%t", len(m.configPhase1Results), len(result.TopN(m.configPhase1Results, 0)), strings.TrimSpace(m.configURL) == "")
 		if strings.TrimSpace(m.configURL) == "" {
 			m.configPhase1Only = true
 			if liveResultWriter != nil {
@@ -510,6 +534,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.startConfigPhase2(topIPs)
 
 	case tea.KeyMsg:
+		debuglog.Printf("key page=%s key=%s", pageName(m.page), safeKeyString(msg))
 		return m.handleKey(msg)
 	}
 
@@ -568,8 +593,13 @@ func (m *AppModel) applySelectedProvider(kind provider.Kind) {
 
 func (m AppModel) menuEntries() []menuEntry {
 	name := m.currentProviderName()
+	debugState := "OFF"
+	if m.debugMode {
+		debugState = "ON"
+	}
 	return []menuEntry{
 		{"Find Working IPs", fmt.Sprintf("scan %s IPs — config optional", name)},
+		{fmt.Sprintf("Debug Mode: %s", debugState), "toggle diagnostic logging and restart"},
 		{"About", ""},
 		{"Quit", ""},
 	}
@@ -618,6 +648,7 @@ func (m AppModel) handleProviderSelectKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m AppModel) selectMenuItem() (tea.Model, tea.Cmd) {
 	switch m.menuIdx {
 	case menuFindWorking:
+		debuglog.Printf("menu_select item=find_working provider=%s", m.currentProvider())
 		m.page = PageScanWithConfig
 		m.configInput.SetValue("")
 		m.configInput.Blur()
@@ -647,10 +678,23 @@ func (m AppModel) selectMenuItem() (tea.Model, tea.Cmd) {
 		m.liveResultPath = ""
 		clearLiveResultWriter()
 		m.statusMsg = ""
+		debuglog.Printf("page_enter page=scan_with_config debug=%t", m.debugMode)
 		return m, nil
+	case menuDebugMode:
+		next := !m.debugMode
+		if err := debuglog.SaveSettings(debuglog.Settings{DebugMode: next}); err != nil {
+			m.statusMsg = fmt.Sprintf("debug mode save failed: %v", err)
+			debuglog.Printf("debug_toggle_failed target=%t error=%q", next, err.Error())
+			return m, nil
+		}
+		debuglog.Printf("debug_toggle target=%t restart=true", next)
+		m.restartRequested = true
+		return m, tea.Quit
 	case menuAbout:
+		debuglog.Printf("menu_select item=about")
 		m.page = PageAbout
 	case menuQuit:
+		debuglog.Printf("menu_select item=quit")
 		return m, tea.Quit
 	}
 	return m, nil
@@ -1065,6 +1109,48 @@ func formatValidationLatency(latency time.Duration) string {
 		return fmt.Sprintf("%dms", ms)
 	}
 	return fmt.Sprintf("%.1fs", latency.Seconds())
+}
+
+func safeKeyString(msg tea.KeyMsg) string {
+	if msg.Type == tea.KeyRunes {
+		return fmt.Sprintf("runes:%d", len(msg.Runes))
+	}
+	return msg.String()
+}
+
+func pageName(page Page) string {
+	switch page {
+	case PageProviderSelect:
+		return "provider_select"
+	case PageHome:
+		return "home"
+	case PageQuickScanCount:
+		return "quick_scan_count"
+	case PageScanConfig:
+		return "scan_config"
+	case PageLiveScan:
+		return "live_scan"
+	case PageResults:
+		return "results"
+	case PageColos:
+		return "colos"
+	case PageLiveColos:
+		return "live_colos"
+	case PageAbout:
+		return "about"
+	case PageScanWithConfig:
+		return "scan_with_config"
+	case PageConfigOptional:
+		return "config_optional"
+	case PageConfigSetup:
+		return "config_setup"
+	case PageConfigPhase1:
+		return "config_phase1"
+	case PageConfigPhase2:
+		return "config_phase2"
+	default:
+		return fmt.Sprintf("unknown_%d", page)
+	}
 }
 
 func copyAndSaveIPs(ips []string) string {
@@ -2869,7 +2955,10 @@ type configPhase1Options struct {
 func (m AppModel) startConfigPhase1() tea.Cmd {
 	opts := m.resolvePhase1Options()
 	return func() tea.Msg {
-		go runConfigPhase1(opts)
+		go func() {
+			defer debuglog.Recover("runConfigPhase1")
+			runConfigPhase1(opts)
+		}()
 		return nil
 	}
 }
@@ -2994,6 +3083,7 @@ func (m AppModel) startConfigPhase2(topIPs []*result.Result) tea.Cmd {
 }
 
 func runConfigPhase2(rawURL string, topIPs []*result.Result) {
+	defer debuglog.Recover("runConfigPhase2")
 	cfg, err := xraytest.ParseProxyURL(rawURL)
 	if err != nil {
 		if prog != nil {
@@ -3004,6 +3094,8 @@ func runConfigPhase2(rawURL string, topIPs []*result.Result) {
 
 	ctx := context.Background()
 	total := len(topIPs)
+	debuglog.Printf("config_phase2_start candidates=%d network=%s port=%d sni_set=%t host_set=%t",
+		total, cfg.Network, cfg.Port, cfg.SNI != "", cfg.Host != "")
 
 	for i, r := range topIPs {
 		ip := r.IP.String()

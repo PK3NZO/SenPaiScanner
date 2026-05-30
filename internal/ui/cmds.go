@@ -15,6 +15,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/matinsenpai/senpaiscanner/internal/debuglog"
 	"github.com/matinsenpai/senpaiscanner/internal/engine"
 	"github.com/matinsenpai/senpaiscanner/internal/ipsrc"
 	"github.com/matinsenpai/senpaiscanner/internal/output"
@@ -35,7 +36,10 @@ func nextScanID() int64 { return scanIDCounter.Add(1) }
 // sending ResultMsg and StatsMsg messages to the Bubble Tea program.
 func StartScanCmd(cfg ScanConfig, scanID int64) tea.Cmd {
 	return func() tea.Msg {
-		go runScan(cfg, scanID)
+		go func() {
+			defer debuglog.Recover("runScan")
+			runScan(cfg, scanID)
+		}()
 		return nil
 	}
 }
@@ -44,6 +48,7 @@ func StartScanCmd(cfg ScanConfig, scanID int64) tea.Cmd {
 func CancelScanCmd() tea.Cmd {
 	return func() tea.Msg {
 		if scanCancel != nil {
+			debuglog.Printf("scan_cancel_requested")
 			scanCancel()
 		}
 		return nil
@@ -53,7 +58,10 @@ func CancelScanCmd() tea.Cmd {
 // StartTestCmd runs the test pass against a file of IPs.
 func StartTestCmd(ipFile string, kind provider.Kind, scanID int64) tea.Cmd {
 	return func() tea.Msg {
-		go runTest(ipFile, kind, scanID)
+		go func() {
+			defer debuglog.Recover("runTest")
+			runTest(ipFile, kind, scanID)
+		}()
 		return nil
 	}
 }
@@ -61,7 +69,10 @@ func StartTestCmd(ipFile string, kind provider.Kind, scanID int64) tea.Cmd {
 // StartColosCmd discovers accessible provider PoPs.
 func StartColosCmd(kind provider.Kind, scanID int64) tea.Cmd {
 	return func() tea.Msg {
-		go runColos(kind, scanID)
+		go func() {
+			defer debuglog.Recover("runColos")
+			runColos(kind, scanID)
+		}()
 		return nil
 	}
 }
@@ -78,6 +89,8 @@ func SetProgram(p *tea.Program) { prog = p }
 // ---------------------------------------------------------------------------
 
 func runScan(cfg ScanConfig, scanID int64) {
+	debuglog.Printf("run_scan_start scan_id=%d provider=%s count=%s concurrency=%s timeout=%s mode=%s port=%s use_v4=%t use_v6=%t cidr_set=%t",
+		scanID, cfg.Provider, cfg.Count, cfg.Concurrency, cfg.Timeout, cfg.Mode, cfg.Port, cfg.UseV4, cfg.UseV6, strings.TrimSpace(cfg.CIDR) != "")
 	count, _ := strconv.Atoi(cfg.Count)
 	concurrency, _ := strconv.Atoi(cfg.Concurrency)
 	if concurrency <= 0 {
@@ -168,6 +181,7 @@ func runScan(cfg ScanConfig, scanID int64) {
 		}
 	})
 
+	debuglog.Printf("run_scan_done scan_id=%d tested=%d healthy=%d failed=%d", scanID, eng.Stats().Tested.Load(), eng.Stats().Healthy.Load(), eng.Stats().Failed.Load())
 	sendDone(scanID)
 }
 
@@ -278,6 +292,8 @@ func sendColosDone(scanID int64) {
 // that finds healthy provider IPs (or validates IPs from a file), then signals
 // the UI to start Phase 2 (xray validation) with the best candidates.
 func runConfigPhase1(opts configPhase1Options) {
+	debuglog.Printf("config_phase1_start provider=%s count=%d concurrency=%d timeout=%s from_file=%t ports=%v with_config=%t",
+		opts.provider, opts.count, opts.concurrency, opts.timeout, opts.fromFile, opts.ports, strings.TrimSpace(opts.rawURL) != "")
 	var probeCfg prober.Config
 	var err error
 	if strings.TrimSpace(opts.rawURL) == "" {
@@ -301,6 +317,8 @@ func runConfigPhase1(opts configPhase1Options) {
 	defer cancel()
 
 	callback := func(r *result.Result) {
+		debuglog.Printf("config_phase1_result endpoint=%s healthy=%t mode=%s provider=%s loss=%.1f avg_ms=%d status=%d colo=%s tls=%t ws=%t",
+			formatEndpoint(r.IP.String(), r.Port), r.IsHealthy(), r.ProbeMode, r.Provider, r.Loss(), r.Avg().Milliseconds(), r.HTTPStatus, r.Colo, r.TLSOk, r.WSOk)
 		if liveResultWriter != nil {
 			liveResultWriter.AddPhase1(r)
 		}
@@ -353,6 +371,7 @@ func runConfigPhase1(opts configPhase1Options) {
 	if prog != nil {
 		prog.Send(ConfigPhase1DoneMsg{})
 	}
+	debuglog.Printf("config_phase1_done provider=%s", opts.provider)
 }
 
 type configProbeJob struct {

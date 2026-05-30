@@ -14,8 +14,8 @@ import (
 )
 
 func TestMenuOnlyShowsMainWorkflow(t *testing.T) {
-	if len(menuEntries) != 3 {
-		t.Fatalf("menu entries = %d, want 3", len(menuEntries))
+	if len(menuEntries) != 4 {
+		t.Fatalf("menu entries = %d, want 4", len(menuEntries))
 	}
 	if menuEntries[0].label != "Find Working IPs" {
 		t.Fatalf("first menu item = %q, want Find Working IPs", menuEntries[0].label)
@@ -32,8 +32,8 @@ func TestMenuOnlyShowsMainWorkflow(t *testing.T) {
 func TestRenderedMenuMatchesMainWorkflow(t *testing.T) {
 	m := NewApp("test")
 	entries := m.menuEntries()
-	if len(entries) != 3 {
-		t.Fatalf("rendered menu entries = %d, want 3", len(entries))
+	if len(entries) != 4 {
+		t.Fatalf("rendered menu entries = %d, want 4", len(entries))
 	}
 	for _, entry := range entries {
 		for _, removed := range []string{"Quick Scan", "Custom Scan", "Scan with Config", "Test IPs", "Discover Colos"} {
