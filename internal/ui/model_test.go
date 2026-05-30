@@ -29,6 +29,38 @@ func TestMenuOnlyShowsMainWorkflow(t *testing.T) {
 	}
 }
 
+func TestRenderedMenuMatchesMainWorkflow(t *testing.T) {
+	m := NewApp("test")
+	entries := m.menuEntries()
+	if len(entries) != 3 {
+		t.Fatalf("rendered menu entries = %d, want 3", len(entries))
+	}
+	for _, entry := range entries {
+		for _, removed := range []string{"Quick Scan", "Custom Scan", "Scan with Config", "Test IPs", "Discover Colos"} {
+			if entry.label == removed {
+				t.Fatalf("removed menu item %q is still rendered", removed)
+			}
+		}
+	}
+}
+
+func TestFindWorkingIPsMenuOpensUnifiedConfigFlow(t *testing.T) {
+	m := NewApp("test")
+	m.menuIdx = menuFindWorking
+
+	next, cmd := m.selectMenuItem()
+	if cmd != nil {
+		t.Fatal("selectMenuItem returned unexpected command")
+	}
+	got := next.(AppModel)
+	if got.page != PageScanWithConfig {
+		t.Fatalf("page = %v, want PageScanWithConfig", got.page)
+	}
+	if got.configSetupRow != 0 || got.configOptionalRow != 0 {
+		t.Fatalf("config rows = (%d,%d), want (0,0)", got.configSetupRow, got.configOptionalRow)
+	}
+}
+
 func TestResolvePhase1OptionsUsesRandomCloudflareDefaults(t *testing.T) {
 	m := NewApp("test")
 	m.configURL = "vless://12345678-1234-1234-1234-123456789abc@example.com:443?encryption=none&security=tls&type=ws&host=example.com&path=%2F#test"

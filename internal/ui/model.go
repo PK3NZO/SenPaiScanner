@@ -568,16 +568,8 @@ func (m *AppModel) applySelectedProvider(kind provider.Kind) {
 
 func (m AppModel) menuEntries() []menuEntry {
 	name := m.currentProviderName()
-	popLabel := "PoPs"
-	if m.currentProvider() == provider.CloudFront {
-		popLabel = "edge PoPs"
-	}
 	return []menuEntry{
-		{"Quick Scan", fmt.Sprintf("scan random %s IPs", name)},
-		{"Custom Scan", "configure count, mode, CIDR, output…"},
-		{"Scan with Config", fmt.Sprintf("test %s IPs with your VLESS/xray config", name)},
-		{"Test IPs", "deep-test a list of IPs from file"},
-		{"Discover Colos", fmt.Sprintf("find reachable %s %s", name, popLabel)},
+		{"Find Working IPs", fmt.Sprintf("scan %s IPs — config optional", name)},
 		{"About", ""},
 		{"Quit", ""},
 	}
