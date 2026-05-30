@@ -59,7 +59,7 @@ func New(path string, fmt Format) (*Writer, error) {
 	if fmt == FormatCSV {
 		w.csv = csv.NewWriter(f)
 		_ = w.csv.Write([]string{
-			"ip", "loss_pct", "avg_ms", "min_ms", "max_ms",
+			"ip", "provider", "loss_pct", "avg_ms", "min_ms", "max_ms",
 			"jitter_ms", "download_kbps", "speed_tested", "colo", "tls_ok", "ws_ok", "http_status",
 		})
 		w.csv.Flush()
@@ -97,6 +97,7 @@ func (w *Writer) Close() error {
 func (w *Writer) writeCSV(r *result.Result) error {
 	row := []string{
 		r.IP.String(),
+		r.Provider,
 		fmt.Sprintf("%.1f", r.Loss()),
 		fmt.Sprintf("%.2f", float64(r.Avg().Milliseconds())),
 		fmt.Sprintf("%.2f", float64(r.Min().Milliseconds())),
@@ -118,6 +119,7 @@ func (w *Writer) writeCSV(r *result.Result) error {
 func (w *Writer) writeJSON(r *result.Result) error {
 	type jsonResult struct {
 		IP          string  `json:"ip"`
+		Provider    string  `json:"provider,omitempty"`
 		LossPct     float64 `json:"loss_pct"`
 		AvgMs       float64 `json:"avg_ms"`
 		MinMs       float64 `json:"min_ms"`
@@ -132,6 +134,7 @@ func (w *Writer) writeJSON(r *result.Result) error {
 	}
 	obj := jsonResult{
 		IP:          r.IP.String(),
+		Provider:    r.Provider,
 		LossPct:     r.Loss(),
 		AvgMs:       ms(r.Avg()),
 		MinMs:       ms(r.Min()),

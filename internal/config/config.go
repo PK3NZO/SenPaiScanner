@@ -6,6 +6,7 @@ import "time"
 
 // ScanDefaults are the factory defaults shown in the scan config form.
 var ScanDefaults = struct {
+	Provider    string
 	Count       int
 	Concurrency int
 	Timeout     time.Duration
@@ -16,6 +17,7 @@ var ScanDefaults = struct {
 	UseV6       bool
 	Top         int
 }{
+	Provider:    "cloudflare",
 	Count:       500,
 	Concurrency: 50,
 	Timeout:     5 * time.Second,

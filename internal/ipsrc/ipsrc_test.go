@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"testing"
+
+	"github.com/matinsenpai/senpaiscanner/internal/provider"
 )
 
 func TestNewV4Only(t *testing.T) {
@@ -148,5 +150,18 @@ func TestNewWithOptionsCIDROnly(t *testing.T) {
 	}
 	if len(s.v6Nets) != 0 {
 		t.Fatalf("expected no v6 CIDRs, got %d", len(s.v6Nets))
+	}
+}
+
+func TestNewWithCloudFrontBuiltins(t *testing.T) {
+	s, err := NewWithOptions(true, false, nil, Options{UseBuiltin: true, Provider: provider.CloudFront})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.v4Nets) == 0 {
+		t.Fatal("expected CloudFront IPv4 ranges to load")
+	}
+	if len(s.v6Nets) != 0 {
+		t.Fatalf("expected no CloudFront IPv6 ranges, got %d", len(s.v6Nets))
 	}
 }

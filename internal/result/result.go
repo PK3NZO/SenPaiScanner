@@ -4,23 +4,28 @@ import (
 	"math"
 	"net"
 	"sort"
+	"strings"
 	"time"
+
+	"github.com/matinsenpai/senpaiscanner/internal/provider"
 )
 
 // Result holds all measured statistics for a single Cloudflare IP.
 type Result struct {
-	IP          net.IP
-	Port        int
-	ProbeMode   string          // tcp | tls | http
-	Latencies   []time.Duration // per-try latencies; 0 = failed try
-	TLSOk       bool
-	WSOk        bool // WebSocket connection survived hold test
-	RequireWS   bool // true when WebSocket success is part of health criteria
-	HTTPStatus  int
-	Colo        string
-	Throughput  float64 // bytes/sec, 0 if not measured
-	SpeedTested bool    // true when a payload download check was attempted
-	Timestamp   time.Time
+	IP           net.IP
+	Port         int
+	Provider     string
+	ProbeMode    string          // tcp | tls | http
+	Latencies    []time.Duration // per-try latencies; 0 = failed try
+	TLSOk        bool
+	WSOk         bool // WebSocket connection survived hold test
+	RequireWS    bool // true when WebSocket success is part of health criteria
+	HTTPStatus   int
+	VerifiedHTTP bool
+	Colo         string
+	Throughput   float64 // bytes/sec, 0 if not measured
+	SpeedTested  bool    // true when a payload download check was attempted
+	Timestamp    time.Time
 }
 
 // Loss returns packet loss percentage (0–100).
@@ -111,13 +116,17 @@ func (r *Result) IsHealthy() bool {
 		if r.Port != 80 && !r.TLSOk {
 			return false
 		}
-		if r.HTTPStatus < 200 || r.HTTPStatus >= 400 || r.Colo == "" {
+		if !r.VerifiedHTTP {
 			return false
 		}
 		if r.SpeedTested && r.Throughput <= 0 {
 			return false
 		}
 		if r.RequireWS && !r.WSOk {
+			return false
+		}
+		kind := provider.Normalize(strings.ToLower(r.Provider))
+		if kind == provider.Cloudflare && r.Colo == "" {
 			return false
 		}
 		return true
@@ -139,138 +148,40 @@ const (
 	SortBySpeed
 )
 
-func sortRank(r *Result) int {
-	if r.IsHealthy() {
-		return 0
-	}
-	if r.Avg() > 0 || r.Loss() < 100 {
-		return 1
-	}
-	return 2
-}
-
-func cmpBool(a, b bool) int {
-	switch {
-	case a == b:
-		return 0
-	case a:
-		return -1
-	default:
-		return 1
-	}
-}
-
-func cmpDuration(a, b time.Duration) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	default:
-		return 0
-	}
-}
-
-func cmpFloatAsc(a, b float64) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	default:
-		return 0
-	}
-}
-
-func cmpFloatDesc(a, b float64) int {
-	return -cmpFloatAsc(a, b)
-}
-
-func cmpString(a, b string) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	default:
-		return 0
-	}
-}
-
-func compareResults(a, b *Result, by SortBy) int {
-	if rankCmp := sortRank(a) - sortRank(b); rankCmp != 0 {
-		return rankCmp
-	}
-
-	switch by {
-	case SortByLoss:
-		if cmp := cmpFloatAsc(a.Loss(), b.Loss()); cmp != 0 {
-			return cmp
-		}
-		if cmp := cmpDuration(a.Avg(), b.Avg()); cmp != 0 {
-			return cmp
-		}
-		if cmp := cmpDuration(a.Jitter(), b.Jitter()); cmp != 0 {
-			return cmp
-		}
-	case SortByJitter:
-		if cmp := cmpDuration(a.Jitter(), b.Jitter()); cmp != 0 {
-			return cmp
-		}
-		if cmp := cmpFloatAsc(a.Loss(), b.Loss()); cmp != 0 {
-			return cmp
-		}
-		if cmp := cmpDuration(a.Avg(), b.Avg()); cmp != 0 {
-			return cmp
-		}
-	case SortByColo:
-		if cmp := cmpString(a.Colo, b.Colo); cmp != 0 {
-			return cmp
-		}
-		if cmp := cmpDuration(a.Avg(), b.Avg()); cmp != 0 {
-			return cmp
-		}
-		if cmp := cmpFloatAsc(a.Loss(), b.Loss()); cmp != 0 {
-			return cmp
-		}
-	case SortBySpeed:
-		if cmp := cmpFloatDesc(a.Throughput, b.Throughput); cmp != 0 {
-			return cmp
-		}
-		if cmp := cmpDuration(a.Avg(), b.Avg()); cmp != 0 {
-			return cmp
-		}
-		if cmp := cmpFloatAsc(a.Loss(), b.Loss()); cmp != 0 {
-			return cmp
-		}
-	default:
-		if cmp := cmpDuration(a.Avg(), b.Avg()); cmp != 0 {
-			return cmp
-		}
-		if cmp := cmpFloatAsc(a.Loss(), b.Loss()); cmp != 0 {
-			return cmp
-		}
-		if cmp := cmpDuration(a.Jitter(), b.Jitter()); cmp != 0 {
-			return cmp
-		}
-	}
-
-	if cmp := cmpBool(a.TLSOk, b.TLSOk); cmp != 0 {
-		return cmp
-	}
-	if cmp := cmpBool(a.WSOk, b.WSOk); cmp != 0 {
-		return cmp
-	}
-	if cmp := cmpString(a.IP.String(), b.IP.String()); cmp != 0 {
-		return cmp
-	}
-	return 0
-}
-
 // Sort reorders results in-place according to the given criterion (ascending).
 func Sort(results []*Result, by SortBy) {
-	sort.SliceStable(results, func(i, j int) bool {
-		return compareResults(results[i], results[j], by) < 0
+	sort.Slice(results, func(i, j int) bool {
+		a, b := results[i], results[j]
+		switch by {
+		case SortByLoss:
+			if a.Loss() != b.Loss() {
+				return a.Loss() < b.Loss()
+			}
+			return a.Avg() < b.Avg()
+		case SortByJitter:
+			return a.Jitter() < b.Jitter()
+		case SortByColo:
+			if a.Colo != b.Colo {
+				return a.Colo < b.Colo
+			}
+			return a.Avg() < b.Avg()
+		case SortBySpeed:
+			if a.Throughput != b.Throughput {
+				return a.Throughput > b.Throughput
+			}
+			return a.Avg() < b.Avg()
+		default: // SortByAvg
+			if a.Avg() != b.Avg() {
+				if a.Avg() == 0 {
+					return false
+				}
+				if b.Avg() == 0 {
+					return true
+				}
+				return a.Avg() < b.Avg()
+			}
+			return a.Loss() < b.Loss()
+		}
 	})
 }
 

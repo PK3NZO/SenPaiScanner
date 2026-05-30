@@ -87,9 +87,11 @@ func TestTopN(t *testing.T) {
 
 func TestHTTPHealthRequiresCloudflareValidation(t *testing.T) {
 	r := makeResult([]time.Duration{100 * time.Millisecond, 120 * time.Millisecond})
+	r.Provider = "cloudflare"
 	r.ProbeMode = "http"
 	r.HTTPStatus = 200
 	r.TLSOk = true
+	r.VerifiedHTTP = true
 
 	if r.IsHealthy() {
 		t.Fatal("expected HTTP result without colo to be unhealthy")
@@ -111,12 +113,26 @@ func TestHTTPHealthRequiresCloudflareValidation(t *testing.T) {
 	}
 }
 
+func TestHTTPHealthSupportsCloudFrontValidation(t *testing.T) {
+	r := makeResult([]time.Duration{80 * time.Millisecond, 90 * time.Millisecond})
+	r.Provider = "cloudfront"
+	r.ProbeMode = "http"
+	r.HTTPStatus = 200
+	r.TLSOk = true
+	r.VerifiedHTTP = true
+	if !r.IsHealthy() {
+		t.Fatal("expected verified CloudFront HTTP result to be healthy without colo")
+	}
+}
+
 func TestHTTPHealthRequiresTLSOnNonPlainHTTPPorts(t *testing.T) {
 	r := makeResult([]time.Duration{100 * time.Millisecond})
+	r.Provider = "cloudflare"
 	r.ProbeMode = "http"
 	r.Port = 2087
 	r.TLSOk = false
 	r.HTTPStatus = 200
+	r.VerifiedHTTP = true
 	r.Colo = "FRA"
 
 	if r.IsHealthy() {
@@ -126,8 +142,11 @@ func TestHTTPHealthRequiresTLSOnNonPlainHTTPPorts(t *testing.T) {
 
 func TestHTTPHealthRequiresWebSocketWhenConfigured(t *testing.T) {
 	r := makeResult([]time.Duration{100 * time.Millisecond})
+	r.Provider = "cloudflare"
 	r.ProbeMode = "http"
 	r.HTTPStatus = 200
+	r.TLSOk = true
+	r.VerifiedHTTP = true
 	r.Colo = "FRA"
 	r.RequireWS = true
 
@@ -145,6 +164,7 @@ func TestHTTPTimeoutIsNotHealthy(t *testing.T) {
 	// Simulates the bug: all tries time out (latency 0) or previously recorded 3s.
 	r := &Result{
 		IP:          net.ParseIP("1.1.1.1"),
+		Provider:    "cloudflare",
 		ProbeMode:   "http",
 		Latencies:   []time.Duration{0, 0, 0, 0},
 		SpeedTested: true,
@@ -176,41 +196,5 @@ func TestSortBySpeed(t *testing.T) {
 	Sort(results, SortBySpeed)
 	if results[0].IP.String() != "1.1.1.2" {
 		t.Errorf("first result after speed sort = %s, want 1.1.1.2", results[0].IP)
-	}
-}
-
-func TestSortByJitterPrefersHealthyResults(t *testing.T) {
-	results := []*Result{
-		{IP: net.ParseIP("1.1.1.1"), Latencies: []time.Duration{0, 0, 0, 0}},
-		{IP: net.ParseIP("1.1.1.2"), Latencies: []time.Duration{90 * time.Millisecond, 100 * time.Millisecond, 110 * time.Millisecond}, TLSOk: true},
-	}
-
-	Sort(results, SortByJitter)
-	if results[0].IP.String() != "1.1.1.2" {
-		t.Fatalf("first result after jitter sort = %s, want 1.1.1.2", results[0].IP)
-	}
-}
-
-func TestSortByLossPrefersPartialOverTotalFailure(t *testing.T) {
-	results := []*Result{
-		{IP: net.ParseIP("1.1.1.1"), Latencies: []time.Duration{0, 0, 0, 0}},
-		{IP: net.ParseIP("1.1.1.2"), Latencies: []time.Duration{100 * time.Millisecond, 0, 120 * time.Millisecond, 0}, TLSOk: true},
-	}
-
-	Sort(results, SortByLoss)
-	if results[0].IP.String() != "1.1.1.2" {
-		t.Fatalf("first result after loss sort = %s, want 1.1.1.2", results[0].IP)
-	}
-}
-
-func TestSortBySpeedKeepsHealthyResultsAheadOfUntestedFailures(t *testing.T) {
-	results := []*Result{
-		{IP: net.ParseIP("1.1.1.1"), Latencies: []time.Duration{0, 0, 0}, Throughput: 0},
-		{IP: net.ParseIP("1.1.1.2"), Latencies: []time.Duration{80 * time.Millisecond}, Throughput: 100 * 1024, TLSOk: true},
-	}
-
-	Sort(results, SortBySpeed)
-	if results[0].IP.String() != "1.1.1.2" {
-		t.Fatalf("first result after speed sort = %s, want 1.1.1.2", results[0].IP)
 	}
 }

@@ -4,8 +4,9 @@ package ui
 type Page int
 
 const (
-	PageHome           Page = iota
-	PageQuickScanCount      // count picker for Quick Scan
+	PageProviderSelect Page = iota
+	PageHome
+	PageQuickScanCount // count picker for Quick Scan
 	PageScanConfig
 	PageLiveScan
 	PageResults

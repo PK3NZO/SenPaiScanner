@@ -11,22 +11,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/matinsenpai/senpaiscanner/internal/provider"
 	"github.com/matinsenpai/senpaiscanner/internal/result"
 )
-
-// sniHostnames is a list of well-known Cloudflare hostnames used as SNI values.
-// Rotating SNI reduces the chance of deep-packet inspection blackholing.
-var sniHostnames = []string{
-	"speed.cloudflare.com",
-	"www.cloudflare.com",
-	"cloudflare.com",
-	"1.1.1.1.cdn.cloudflare.net",
-	"blog.cloudflare.com",
-}
 
 // Config holds parameters for a single probe session.
 type Config struct {
 	Port               int
+	Provider           provider.Kind
 	Mode               Mode
 	Tries              int
 	Timeout            time.Duration
@@ -83,6 +75,7 @@ func Probe(ctx context.Context, ip net.IP, cfg Config) *result.Result {
 	r := &result.Result{
 		IP:        ip,
 		Port:      cfg.Port,
+		Provider:  string(provider.Normalize(string(cfg.Provider))),
 		ProbeMode: cfg.Mode.String(),
 		Timestamp: time.Now(),
 		Latencies: make([]time.Duration, cfg.Tries),
@@ -98,14 +91,18 @@ func Probe(ctx context.Context, ip net.IP, cfg Config) *result.Result {
 		}
 		sni := cfg.SNI
 		if sni == "" && cfg.Mode == ModeHTTP {
-			sni = "speed.cloudflare.com"
+			sni = provider.DefaultHTTPHost(cfg.Provider)
 		} else if sni == "" {
-			sni = sniHostnames[rand.Intn(len(sniHostnames))]
+			hosts := provider.RotationHosts(cfg.Provider)
+			if len(hosts) > 0 {
+				sni = hosts[rand.Intn(len(hosts))]
+			}
 		}
 
 		var lat time.Duration
 		var tlsOk bool
 		var httpStatus int
+		var verified bool
 		var colo string
 		var throughput float64
 
@@ -116,7 +113,10 @@ func Probe(ctx context.Context, ip net.IP, cfg Config) *result.Result {
 			lat, tlsOk = probeTLS(ctx, ip, cfg.Port, sni, cfg.Timeout, cfg.InsecureSkipVerify)
 		case ModeHTTP:
 			var wsOk bool
-			lat, tlsOk, httpStatus, colo, throughput, wsOk = probeHTTP(ctx, ip, cfg.Port, sni, cfg.Timeout, cfg.SpeedBytes, cfg.InsecureSkipVerify, cfg.WebSocketHost, cfg.WebSocketPath, cfg.RequireWebSocket)
+			lat, tlsOk, httpStatus, verified, colo, throughput, wsOk = probeHTTP(
+				ctx, ip, cfg.Provider, cfg.Port, sni, cfg.Timeout, cfg.SpeedBytes,
+				cfg.InsecureSkipVerify, cfg.WebSocketHost, cfg.WebSocketPath, cfg.RequireWebSocket,
+			)
 			if wsOk {
 				r.WSOk = true
 			}
@@ -128,6 +128,9 @@ func Probe(ctx context.Context, ip net.IP, cfg Config) *result.Result {
 		}
 		if httpStatus != 0 {
 			r.HTTPStatus = httpStatus
+		}
+		if verified {
+			r.VerifiedHTTP = true
 		}
 		if colo != "" {
 			r.Colo = colo
@@ -193,10 +196,9 @@ func probeTLS(ctx context.Context, ip net.IP, port int, sni string, timeout time
 	return lat, true
 }
 
-// probeHTTP fetches /cdn-cgi/trace to confirm the IP is a real Cloudflare edge
-// and to determine the colo identifier.
-func probeHTTP(ctx context.Context, ip net.IP, port int, sni string, timeout time.Duration, speedBytes int64, insecure bool, wsHost, wsPath string, requireWS bool) (
-	lat time.Duration, tlsOk bool, httpStatus int, colo string, throughput float64, wsOk bool,
+// probeHTTP validates the candidate IP using a provider-specific HTTP request.
+func probeHTTP(ctx context.Context, ip net.IP, kind provider.Kind, port int, sni string, timeout time.Duration, speedBytes int64, insecure bool, wsHost, wsPath string, requireWS bool) (
+	lat time.Duration, tlsOk bool, httpStatus int, verified bool, colo string, throughput float64, wsOk bool,
 ) {
 	addr := fmt.Sprintf("%s:%d", ip.String(), port)
 
@@ -226,7 +228,7 @@ func probeHTTP(ctx context.Context, ip net.IP, port int, sni string, timeout tim
 	if port == 80 {
 		scheme = "http"
 	}
-	url := fmt.Sprintf("%s://%s/cdn-cgi/trace", scheme, sni)
+	url := fmt.Sprintf("%s://%s%s", scheme, sni, provider.DefaultHTTPPath(kind))
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -237,46 +239,28 @@ func probeHTTP(ctx context.Context, ip net.IP, port int, sni string, timeout tim
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, false, 0, "", 0, false
+		return 0, false, 0, false, "", 0, false
 	}
 	lat = time.Since(start)
 	defer resp.Body.Close()
 
 	tlsOk = resp.TLS != nil
 	httpStatus = resp.StatusCode
-	colo = parseColoRay(resp.Header.Get("CF-Ray"))
-
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if traceColo := parseColoCDN(string(body)); traceColo != "" {
-		colo = traceColo
+	verified, colo = provider.VerifyHTTP(kind, httpStatus, resp.Header, string(body))
+	if speedBytes > 0 && verified && provider.SupportsDownload(kind) {
+		throughput = probeDownload(ctx, ip, kind, port, timeout, speedBytes)
 	}
 
-	if httpStatus >= 200 && httpStatus < 400 && colo != "" {
-		if speedBytes > 0 {
-			throughput = probeDownload(ctx, ip, port, timeout, speedBytes)
-		}
-		if speedBytes > 0 || requireWS {
-			wsOk = probeWebSocket(ctx, ip, port, sni, wsHost, wsPath, timeout)
-		}
+	if verified && provider.SupportsWebSocketHold(kind) && (speedBytes > 0 || requireWS) {
+		wsOk = probeWebSocket(ctx, ip, port, sni, wsHost, wsPath, timeout)
 	}
 
 	return
 }
 
 // probeWebSocket tests whether WebSocket-grade TLS connections reach the
-// Cloudflare edge without being killed by DPI. It does two things:
-//
-//  1. Holds the TLS connection idle for 2 s before sending any data.
-//     Some DPI systems RST connections that look like long-lived TLS tunnels
-//     without early data — if the connection dies during the idle hold, WSOk
-//     is false.
-//
-//  2. Sends a WebSocket upgrade request and checks that any HTTP response
-//     arrives (even 400/404). If DPI drops the connection before CF can
-//     respond, WSOk is false.
-//
-// TLS cert verification is skipped here because the main probeHTTP call
-// already verified the certificate for this IP.
+// provider edge without being killed by DPI.
 func probeWebSocket(ctx context.Context, ip net.IP, port int, sni, host, path string, timeout time.Duration) bool {
 	addr := fmt.Sprintf("%s:%d", ip.String(), port)
 	if host == "" {
@@ -300,21 +284,16 @@ func probeWebSocket(ctx context.Context, ip net.IP, port int, sni, host, path st
 		return false
 	}
 
-	// Phase 1: idle hold — detect DPI that RSTs long-lived TLS connections
-	// before any application data is exchanged.
+	// Phase 1: idle hold.
 	tlsConn.SetDeadline(time.Now().Add(2 * time.Second))
 	oneByte := make([]byte, 1)
 	if _, err := tlsConn.Read(oneByte); err != nil {
-		// A timeout here is EXPECTED (server speaks first only after WS upgrade).
-		// Any other error (RST, EOF) means the connection was killed while idle.
 		if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
 			return false
 		}
 	}
 
-	// Phase 2: send WebSocket upgrade and verify CF responds.
-	// If DPI RSTs connections containing WS upgrade headers, we won't get a
-	// response — returning false signals that WS traffic is DPI-blocked.
+	// Phase 2: send WebSocket upgrade and verify the edge responds.
 	wsReq := fmt.Sprintf(
 		"GET %s HTTP/1.1\r\n"+
 			"Host: %s\r\n"+
@@ -329,17 +308,14 @@ func probeWebSocket(ctx context.Context, ip net.IP, port int, sni, host, path st
 		return false
 	}
 
-	// Read the first chunk of the response. CF will answer with at least an
-	// HTTP status line (e.g. "HTTP/1.1 400 Bad Request"). If we see "HTTP/",
-	// the WS upgrade reached CF — the connection is DPI-permissive.
-	respBuf := make([]byte, 1024)
+	buf := make([]byte, 1024)
 	tlsConn.SetDeadline(time.Now().Add(timeout / 3))
-	n, err := tlsConn.Read(respBuf)
+	n, err := tlsConn.Read(buf)
 	if err != nil || n == 0 {
 		return false
 	}
 
-	return strings.Contains(string(respBuf[:n]), "HTTP/")
+	return strings.Contains(string(buf[:n]), "HTTP/")
 }
 
 func normalizeWSPath(path string) string {
@@ -352,11 +328,15 @@ func normalizeWSPath(path string) string {
 	return path
 }
 
-// probeDownload fetches a small sample from speed.cloudflare.com while forcing
-// the TCP connection to the candidate IP. This is still not a full Xray/V2Ray
-// test, but it catches many IPs that handshake cleanly and then stall on data.
-func probeDownload(ctx context.Context, ip net.IP, port int, timeout time.Duration, bytes int64) float64 {
+// probeDownload fetches a small provider-owned payload sample while forcing
+// the TCP connection to the candidate IP.
+func probeDownload(ctx context.Context, ip net.IP, kind provider.Kind, port int, timeout time.Duration, bytes int64) float64 {
 	if bytes <= 0 {
+		return 0
+	}
+
+	downloadURL := provider.DownloadURL(kind, "https", bytes)
+	if downloadURL == "" {
 		return 0
 	}
 
@@ -366,7 +346,7 @@ func probeDownload(ctx context.Context, ip net.IP, port int, timeout time.Durati
 			return (&net.Dialer{Timeout: timeout / 4}).DialContext(ctx, network, addr)
 		},
 		TLSClientConfig: &tls.Config{
-			ServerName: "speed.cloudflare.com",
+			ServerName: provider.DefaultHTTPHost(kind),
 			MinVersion: tls.VersionTLS12,
 		},
 		DisableKeepAlives:   true,
@@ -378,7 +358,7 @@ func probeDownload(ctx context.Context, ip net.IP, port int, timeout time.Durati
 	if port == 80 {
 		scheme = "http"
 	}
-	url := fmt.Sprintf("%s://speed.cloudflare.com/__down?bytes=%d", scheme, bytes)
+	url := provider.DownloadURL(kind, scheme, bytes)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0
@@ -404,27 +384,4 @@ func probeDownload(ctx context.Context, ip net.IP, port int, timeout time.Durati
 		return 0
 	}
 	return float64(n) / elapsed
-}
-
-// parseColoCDN extracts the "colo" field from /cdn-cgi/trace responses.
-func parseColoCDN(body string) string {
-	for _, line := range strings.Split(body, "\n") {
-		line = strings.TrimRight(line, "\r")
-		if strings.HasPrefix(line, "colo=") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "colo="))
-		}
-	}
-	return ""
-}
-
-func parseColoRay(ray string) string {
-	parts := strings.Split(ray, "-")
-	if len(parts) < 2 {
-		return ""
-	}
-	colo := strings.TrimSpace(parts[len(parts)-1])
-	if len(colo) < 3 {
-		return ""
-	}
-	return strings.ToUpper(colo[:3])
 }

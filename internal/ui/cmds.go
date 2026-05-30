@@ -19,6 +19,7 @@ import (
 	"github.com/matinsenpai/senpaiscanner/internal/ipsrc"
 	"github.com/matinsenpai/senpaiscanner/internal/output"
 	"github.com/matinsenpai/senpaiscanner/internal/prober"
+	"github.com/matinsenpai/senpaiscanner/internal/provider"
 	"github.com/matinsenpai/senpaiscanner/internal/result"
 	"github.com/matinsenpai/senpaiscanner/internal/xraytest"
 )
@@ -50,17 +51,17 @@ func CancelScanCmd() tea.Cmd {
 }
 
 // StartTestCmd runs the test pass against a file of IPs.
-func StartTestCmd(ipFile string, scanID int64) tea.Cmd {
+func StartTestCmd(ipFile string, kind provider.Kind, scanID int64) tea.Cmd {
 	return func() tea.Msg {
-		go runTest(ipFile, scanID)
+		go runTest(ipFile, kind, scanID)
 		return nil
 	}
 }
 
-// StartColosCmd discovers accessible Cloudflare PoPs.
-func StartColosCmd(scanID int64) tea.Cmd {
+// StartColosCmd discovers accessible provider PoPs.
+func StartColosCmd(kind provider.Kind, scanID int64) tea.Cmd {
 	return func() tea.Msg {
-		go runColos(scanID)
+		go runColos(kind, scanID)
 		return nil
 	}
 }
@@ -96,6 +97,7 @@ func runScan(cfg ScanConfig, scanID int64) {
 	if err != nil {
 		mode = prober.ModeHTTP
 	}
+	kind := provider.Normalize(cfg.Provider)
 
 	var extra []string
 	for _, c := range strings.Split(cfg.CIDR, ",") {
@@ -106,7 +108,7 @@ func runScan(cfg ScanConfig, scanID int64) {
 	}
 
 	useBuiltin := len(extra) == 0
-	src, err := ipsrc.NewWithOptions(cfg.UseV4, cfg.UseV6, extra, ipsrc.Options{UseBuiltin: useBuiltin})
+	src, err := ipsrc.NewWithOptions(cfg.UseV4, cfg.UseV6, extra, ipsrc.Options{UseBuiltin: useBuiltin, Provider: kind})
 	if err != nil {
 		sendError(scanID, fmt.Sprintf("Scan setup failed: %v", err))
 		sendDone(scanID)
@@ -121,12 +123,13 @@ func runScan(cfg ScanConfig, scanID int64) {
 		Concurrency: concurrency,
 		ProbeConfig: prober.Config{
 			Port:             port,
+			Provider:         kind,
 			Mode:             mode,
 			Tries:            tries,
 			Timeout:          timeout,
 			SNI:              cfg.SNI,
-			SpeedBytes:       speedSampleForMode(mode),
-			RequireWebSocket: mode == prober.ModeHTTP && speedSampleForMode(mode) > 0,
+			SpeedBytes:       speedSampleForMode(kind, mode),
+			RequireWebSocket: mode == prober.ModeHTTP && provider.SupportsWebSocketHold(kind) && speedSampleForMode(kind, mode) > 0,
 		},
 	}
 	eng := engine.New(engCfg)
@@ -168,7 +171,7 @@ func runScan(cfg ScanConfig, scanID int64) {
 	sendDone(scanID)
 }
 
-func runTest(ipFile string, scanID int64) {
+func runTest(ipFile string, kind provider.Kind, scanID int64) {
 	ips, err := loadIPs(ipFile)
 	if err != nil {
 		sendError(scanID, fmt.Sprintf("Test IPs failed: %v", err))
@@ -189,12 +192,13 @@ func runTest(ipFile string, scanID int64) {
 		Concurrency: 20,
 		ProbeConfig: prober.Config{
 			Port:             443,
+			Provider:         kind,
 			Mode:             prober.ModeHTTP,
 			Tries:            6,
 			Timeout:          10 * time.Second,
-			SNI:              "speed.cloudflare.com",
-			SpeedBytes:       512 * 1024,
-			RequireWebSocket: true,
+			SNI:              provider.DefaultHTTPHost(kind),
+			SpeedBytes:       speedSampleForMode(kind, prober.ModeHTTP),
+			RequireWebSocket: provider.SupportsWebSocketHold(kind),
 		},
 	}
 	eng := engine.New(engCfg)
@@ -210,8 +214,8 @@ func runTest(ipFile string, scanID int64) {
 	sendDone(scanID)
 }
 
-func runColos(scanID int64) {
-	src, err := ipsrc.New(true, false, nil)
+func runColos(kind provider.Kind, scanID int64) {
+	src, err := ipsrc.NewWithOptions(true, false, nil, ipsrc.Options{UseBuiltin: true, Provider: kind})
 	if err != nil {
 		sendError(scanID, fmt.Sprintf("Colo discovery failed: %v", err))
 		sendColosDone(scanID)
@@ -226,6 +230,7 @@ func runColos(scanID int64) {
 		Concurrency: 80,
 		ProbeConfig: prober.Config{
 			Port:       443,
+			Provider:   kind,
 			Mode:       prober.ModeHTTP,
 			Tries:      2,
 			Timeout:    5 * time.Second,
@@ -270,7 +275,7 @@ func sendColosDone(scanID int64) {
 }
 
 // runConfigPhase1 runs Phase 1 of "Scan with Config": a fast connectivity scan
-// that finds healthy Cloudflare IPs (or validates IPs from a file), then signals
+// that finds healthy provider IPs (or validates IPs from a file), then signals
 // the UI to start Phase 2 (xray validation) with the best candidates.
 func runConfigPhase1(opts configPhase1Options) {
 	probeCfg, err := configProbeFromURL(opts.rawURL, opts.timeout)
@@ -317,7 +322,7 @@ func runConfigPhase1(opts configPhase1Options) {
 		close(ch)
 		ipStream = ch
 	} else {
-		src, err := ipsrc.New(true, false, nil)
+		src, err := ipsrc.NewWithOptions(true, false, nil, ipsrc.Options{UseBuiltin: true, Provider: opts.provider})
 		if err != nil {
 			if prog != nil {
 				prog.Send(ConfigPhase1DoneMsg{})
@@ -373,6 +378,31 @@ func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, co
 	wg.Wait()
 }
 
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+func buildColoSet(raw string) map[string]bool {
+	if raw == "" {
+		return nil
+	}
+	set := make(map[string]bool)
+	for _, c := range strings.Split(raw, ",") {
+		c = strings.TrimSpace(strings.ToUpper(c))
+		if c != "" {
+			set[c] = true
+		}
+	}
+	return set
+}
+
+func passesColoFilter(r *result.Result, set map[string]bool) bool {
+	if set == nil {
+		return true
+	}
+	return set[strings.ToUpper(r.Colo)]
+}
+
 func configProbeFromURL(rawURL string, timeout time.Duration) (prober.Config, error) {
 	cfg, err := xraytest.ParseProxyURL(rawURL)
 	if err != nil {
@@ -398,31 +428,6 @@ func configProbeFromURL(rawURL string, timeout time.Duration) (prober.Config, er
 		probeCfg.RequireWebSocket = true
 	}
 	return probeCfg, nil
-}
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
-func buildColoSet(raw string) map[string]bool {
-	if raw == "" {
-		return nil
-	}
-	set := make(map[string]bool)
-	for _, c := range strings.Split(raw, ",") {
-		c = strings.TrimSpace(strings.ToUpper(c))
-		if c != "" {
-			set[c] = true
-		}
-	}
-	return set
-}
-
-func passesColoFilter(r *result.Result, set map[string]bool) bool {
-	if set == nil {
-		return true
-	}
-	return set[strings.ToUpper(r.Colo)]
 }
 
 func ipsFileSearchPaths() []string {
@@ -485,8 +490,8 @@ func loadIPs(path string) ([]net.IP, error) {
 	return ips, sc.Err()
 }
 
-func speedSampleForMode(mode prober.Mode) int64 {
-	if mode != prober.ModeHTTP {
+func speedSampleForMode(kind provider.Kind, mode prober.Mode) int64 {
+	if mode != prober.ModeHTTP || !provider.SupportsDownload(kind) {
 		return 0
 	}
 	// 64 KB is enough to detect IPs that stall on real data while still

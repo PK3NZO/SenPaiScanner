@@ -13,6 +13,8 @@ import (
 	"time"
 
 	_ "embed"
+
+	"github.com/matinsenpai/senpaiscanner/internal/provider"
 )
 
 //go:embed ranges_v4.txt
@@ -20,6 +22,12 @@ var builtinV4 string
 
 //go:embed ranges_v6.txt
 var builtinV6 string
+
+//go:embed ranges_cloudfront_v4.txt
+var builtinCloudFrontV4 string
+
+//go:embed ranges_cloudfront_v6.txt
+var builtinCloudFrontV6 string
 
 const (
 	cfIPsV4URL = "https://www.cloudflare.com/ips-v4/"
@@ -40,6 +48,8 @@ type Options struct {
 	// be treated as an exact scan scope rather than as additions to Cloudflare's
 	// full published ranges.
 	UseBuiltin bool
+	// Provider selects which embedded range set to use.
+	Provider provider.Kind
 }
 
 // New builds a Source from the embedded Cloudflare ranges plus optional extra
@@ -55,7 +65,7 @@ func NewWithOptions(useV4, useV6 bool, extra []string, opts Options) (*Source, e
 	}
 
 	if opts.UseBuiltin && useV4 {
-		nets, err := parseLines(builtinV4)
+		nets, err := parseLines(builtinRangesV4(opts.Provider))
 		if err != nil {
 			return nil, err
 		}
@@ -63,7 +73,7 @@ func NewWithOptions(useV4, useV6 bool, extra []string, opts Options) (*Source, e
 	}
 
 	if opts.UseBuiltin && useV6 {
-		nets, err := parseLines(builtinV6)
+		nets, err := parseLines(builtinRangesV6(opts.Provider))
 		if err != nil {
 			return nil, err
 		}
@@ -222,6 +232,24 @@ func parseLines(raw string) ([]*net.IPNet, error) {
 		nets = append(nets, ipNet)
 	}
 	return nets, sc.Err()
+}
+
+func builtinRangesV4(kind provider.Kind) string {
+	switch provider.Normalize(string(kind)) {
+	case provider.CloudFront:
+		return builtinCloudFrontV4
+	default:
+		return builtinV4
+	}
+}
+
+func builtinRangesV6(kind provider.Kind) string {
+	switch provider.Normalize(string(kind)) {
+	case provider.CloudFront:
+		return builtinCloudFrontV6
+	default:
+		return builtinV6
+	}
 }
 
 func randomFromNet(n *net.IPNet, rng *rand.Rand) net.IP {
