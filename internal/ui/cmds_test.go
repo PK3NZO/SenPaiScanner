@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/matinsenpai/senpaiscanner/internal/prober"
 	"github.com/matinsenpai/senpaiscanner/internal/provider"
 )
 
@@ -42,7 +43,23 @@ func TestConfigProbeFromURLPreservesCloudFrontProviderAndDisablesWSRequirement(t
 	if cfg.Provider != provider.CloudFront {
 		t.Fatalf("Provider = %q, want %q", cfg.Provider, provider.CloudFront)
 	}
+	if cfg.Mode != prober.ModeTLS {
+		t.Fatalf("Mode = %s, want tls", cfg.Mode)
+	}
 	if cfg.RequireWebSocket {
 		t.Fatal("RequireWebSocket = true, want false for CloudFront")
+	}
+}
+
+func TestDefaultPhase1ProbeConfigKeepsCloudFrontHTTPValidation(t *testing.T) {
+	cfg := defaultPhase1ProbeConfig(7*time.Second, provider.CloudFront)
+	if cfg.Provider != provider.CloudFront {
+		t.Fatalf("Provider = %q, want %q", cfg.Provider, provider.CloudFront)
+	}
+	if cfg.Mode != prober.ModeHTTP {
+		t.Fatalf("Mode = %s, want http", cfg.Mode)
+	}
+	if cfg.SNI != provider.DefaultHTTPHost(provider.CloudFront) {
+		t.Fatalf("SNI = %q, want default CloudFront host", cfg.SNI)
 	}
 }

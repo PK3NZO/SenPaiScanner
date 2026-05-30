@@ -549,6 +549,14 @@ func configProbeFromURL(rawURL string, timeout time.Duration, kind provider.Kind
 		SNI:                sni,
 		InsecureSkipVerify: true,
 	}
+	if provider.Normalize(string(kind)) == provider.CloudFront {
+		if cfg.Security == "none" || cfg.Port == 80 {
+			probeCfg.Mode = prober.ModeTCP
+		} else {
+			probeCfg.Mode = prober.ModeTLS
+		}
+		return probeCfg, nil
+	}
 	if cfg.Network == "ws" {
 		probeCfg.WebSocketHost = cfg.Host
 		probeCfg.WebSocketPath = cfg.Path
