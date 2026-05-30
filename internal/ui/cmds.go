@@ -421,7 +421,7 @@ func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, co
 	}
 
 	maybeEnqueueNeighbors := func(r *result.Result) {
-		if !neighbor.enabled || !r.IsHealthy() || len(neighbor.nets) == 0 {
+		if ctx.Err() != nil || !neighbor.enabled || !r.IsHealthy() || len(neighbor.nets) == 0 {
 			return
 		}
 
@@ -471,12 +471,7 @@ func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, co
 	go func() {
 		defer func() {
 			for atomic.LoadInt64(&pending) > 0 {
-				select {
-				case <-ctx.Done():
-					close(jobs)
-					return
-				case <-time.After(20 * time.Millisecond):
-				}
+				time.Sleep(20 * time.Millisecond)
 			}
 			close(jobs)
 		}()
