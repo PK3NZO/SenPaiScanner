@@ -278,7 +278,7 @@ func sendColosDone(scanID int64) {
 // that finds healthy provider IPs (or validates IPs from a file), then signals
 // the UI to start Phase 2 (xray validation) with the best candidates.
 func runConfigPhase1(opts configPhase1Options) {
-	probeCfg, err := configProbeFromURL(opts.rawURL, opts.timeout)
+	probeCfg, err := configProbeFromURL(opts.rawURL, opts.timeout, opts.provider)
 	if err != nil {
 		if prog != nil {
 			prog.Send(ConfigPhase1ErrMsg{Err: fmt.Sprintf("invalid URL: %v", err)})
@@ -403,7 +403,7 @@ func passesColoFilter(r *result.Result, set map[string]bool) bool {
 	return set[strings.ToUpper(r.Colo)]
 }
 
-func configProbeFromURL(rawURL string, timeout time.Duration) (prober.Config, error) {
+func configProbeFromURL(rawURL string, timeout time.Duration, kind provider.Kind) (prober.Config, error) {
 	cfg, err := xraytest.ParseProxyURL(rawURL)
 	if err != nil {
 		return prober.Config{}, err
@@ -416,6 +416,7 @@ func configProbeFromURL(rawURL string, timeout time.Duration) (prober.Config, er
 
 	probeCfg := prober.Config{
 		Port:               cfg.Port,
+		Provider:           kind,
 		Mode:               prober.ModeHTTP,
 		Tries:              3,
 		Timeout:            timeout,
@@ -425,7 +426,7 @@ func configProbeFromURL(rawURL string, timeout time.Duration) (prober.Config, er
 	if cfg.Network == "ws" {
 		probeCfg.WebSocketHost = cfg.Host
 		probeCfg.WebSocketPath = cfg.Path
-		probeCfg.RequireWebSocket = true
+		probeCfg.RequireWebSocket = provider.SupportsWebSocketHold(kind)
 	}
 	return probeCfg, nil
 }

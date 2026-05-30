@@ -3,12 +3,14 @@ package ui
 import (
 	"testing"
 	"time"
+
+	"github.com/matinsenpai/senpaiscanner/internal/provider"
 )
 
 func TestConfigProbeFromURLUsesConfigPortSNIAndWebSocket(t *testing.T) {
 	raw := "vless://3441b906-471f-4160-8f2c-a981793e6155@104.17.89.5:2087?encryption=none&security=tls&sni=winter-thunder-0638.matinsenpaivideo2.workers.dev&fp=chrome&insecure=0&allowInsecure=0&type=ws&host=winter-thunder-0638.matinsenpaivideo2.workers.dev&path=%2F#CF"
 
-	cfg, err := configProbeFromURL(raw, 7*time.Second)
+	cfg, err := configProbeFromURL(raw, 7*time.Second, provider.Cloudflare)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,5 +29,20 @@ func TestConfigProbeFromURLUsesConfigPortSNIAndWebSocket(t *testing.T) {
 	}
 	if !cfg.RequireWebSocket {
 		t.Fatal("RequireWebSocket = false, want true")
+	}
+}
+
+func TestConfigProbeFromURLPreservesCloudFrontProviderAndDisablesWSRequirement(t *testing.T) {
+	raw := "vless://3441b906-471f-4160-8f2c-a981793e6155@1.2.3.4:443?encryption=none&security=tls&sni=d111111abcdef8.cloudfront.net&type=ws&host=example.com&path=%2Fws#CFD"
+
+	cfg, err := configProbeFromURL(raw, 7*time.Second, provider.CloudFront)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != provider.CloudFront {
+		t.Fatalf("Provider = %q, want %q", cfg.Provider, provider.CloudFront)
+	}
+	if cfg.RequireWebSocket {
+		t.Fatal("RequireWebSocket = true, want false for CloudFront")
 	}
 }
