@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-informational?style=flat-square)](#installation)
 
-A Cloudflare IP finder with a terminal UI, built for networks where latency is unpredictable and connections drop without warning. Paste your VLESS or Trojan config, pick your settings, and let it find IPs that actually work through your proxy — no commands to memorize.
+A CDN IP finder with a terminal UI, built for networks where latency is unpredictable and connections drop without warning. Pick Cloudflare, CloudFront, Gcore, or Fastly, paste your VLESS or Trojan config, choose your settings, and let it find IPs that actually work through your proxy — no commands to memorize.
 
 ---
 
@@ -16,7 +16,7 @@ Run `senpaiscanner` and you land in a short menu. Navigate with arrow keys and E
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│  ▶  Find Working IPs   paste a config and test CF IPs      │
+│  ▶  Find Working IPs   paste a config and test CDN IPs     │
 │     About                                                │
 │     Quit                                                 │
 └────────────────────────────────────────────────────────────┘
@@ -24,7 +24,7 @@ Run `senpaiscanner` and you land in a short menu. Navigate with arrow keys and E
 
 **Find Working IPs** runs in two phases:
 
-1. **Phase 1 — Connectivity scan** probes candidate Cloudflare IPs using settings derived from your config URL (SNI, host, WebSocket path, port). It checks trace reachability and, for WebSocket configs, whether a WS-style TLS connection survives DPI.
+1. **Phase 1 — Connectivity scan** probes candidate CDN IPs with provider-aware validation. Cloudflare can use settings derived from your config URL (SNI, host, WebSocket path, port) and checks whether WS-style TLS connections survive DPI; CloudFront, Gcore, and Fastly use a config-aware TLS shortlist in config mode, then Phase 2 validates your actual config.
 2. **Phase 2 — xray validation** launches an embedded xray instance and tests the best Phase 1 hits end-to-end through your actual VLESS/Trojan config. Results show endpoint, transport type, download speed, latency (TTFB), and pass/fail status.
 
 When Phase 2 finishes, press **`c`** to copy working `IP:port` endpoints to the clipboard and save them to `ips.txt` next to the binary (or current working directory).
@@ -106,7 +106,7 @@ Paste a **`vless://`** or **`trojan://`** share URL, adjust the setup rows, then
 
 | Row | Options | Notes |
 |---|---|---|
-| **Source** | Random / From File | random Cloudflare IPv4 ranges, or read candidates from `ips.txt` |
+| **Source** | Random / From File | random IPv4 ranges for the selected provider, or read candidates from `ips.txt` |
 | **Count** | 1,000 / 5,000 / 20,000 / Custom | IPs to probe in Phase 1; **ignored when Source is From File** |
 | **Workers** | 50 / 100 / 200 / Custom | parallel probers (default 50 — safe on restricted networks) |
 | **Timeout** | 2s / 3s / 5s / Custom | per-probe deadline (default 5s) |
@@ -135,7 +135,7 @@ Press **Enter** on the last row to continue to the optional config step.
 
 ### Phase 1 — Finding reachable IPs
 
-Without a config URL, Phase 1 uses a standard Cloudflare HTTP probe (`speed.cloudflare.com`, 64 KiB sample). With a config URL, probes use SNI/host/path from your link and require WebSocket success when `type=ws`.
+Without a config URL, Phase 1 uses the selected provider's standard probe. With a config URL, Cloudflare probes use SNI/host/path from your link and require WebSocket success when `type=ws`; CloudFront, Gcore, and Fastly use TLS reachability with your config SNI/host so provider-owned API endpoints do not discard usable shared CDN edges before xray validation.
 
 Press `q` / `Esc` to cancel and return to the menu.
 
@@ -170,7 +170,7 @@ Version string and short project blurb; `Enter` / `q` / `Esc` back to the menu.
 
 **Use From File after a partial run.** Copy working endpoints with `c`, edit `ips.txt`, then re-run with **Source → From File** to validate only your shortlist on more ports.
 
-**Try multiple ports.** Cloudflare CDN ports (443, 8443, 2053, …) behave differently under DPI. Multi-port selection lets Phase 1 find the best `IP:port` pair before xray validation.
+**Try multiple ports.** CDN ports (443, 8443, 2053, …) behave differently under DPI. Multi-port selection lets Phase 1 find the best `IP:port` pair before xray validation.
 
 **WebSocket configs need WS-friendly IPs.** Phase 1 runs an idle TLS hold plus a WebSocket upgrade check when your URL uses `type=ws`. An IP that passes trace but fails WS will not become a Phase 2 candidate.
 
@@ -183,13 +183,13 @@ Version string and short project blurb; `Enter` / `q` / `Esc` back to the menu.
 ## FAQ
 
 **Why doesn't it just run a ping?**
-Cloudflare drops ICMP on their edge IPs. SenPai Scanner validates HTTP/TLS behaviour and, for proxy configs, runs traffic through xray — closer to real VLESS/Trojan usage than ping or bare TCP.
+Many CDN edge IPs drop or deprioritize ICMP. SenPai Scanner validates HTTP/TLS behaviour and, for proxy configs, runs traffic through xray — closer to real VLESS/Trojan usage than ping or bare TCP.
 
 **How is this different from warp-plus?**
-SenPai Scanner does not run a permanent proxy. It finds and validates Cloudflare IPs for **your** xray config and exports `IP:port` lists you can plug into Sing-Box, v2rayN, etc.
+SenPai Scanner does not run a permanent proxy. It finds and validates CDN IPs for **your** xray config and exports `IP:port` lists you can plug into Sing-Box, v2rayN, etc.
 
 **Where do the IP ranges come from?**
-Embedded from Cloudflare's official published lists (`cloudflare.com/ips-v4`, `cloudflare.com/ips-v6`). The binary ships with a snapshot; ranges rarely change.
+Embedded from provider-published lists: Cloudflare's official `ips-v4`/`ips-v6`, AWS CloudFront ranges, Gcore's CDN public IP list, and Fastly's official `public-ip-list`. The binary ships with snapshots; ranges rarely change.
 
 **"ips.txt not found" when using From File**
 Place `ips.txt` next to the executable or in your current working directory before starting. One IP per line; `#` comments and CSV lines (IP in the first column) are supported.

@@ -28,6 +28,7 @@ type Config struct {
 	WebSocketHost      string // empty = SNI
 	WebSocketPath      string // empty = /
 	RequireWebSocket   bool   // require a successful WebSocket probe for HTTP health
+	EarlyStop          bool   // stop once success/failure threshold is decided
 }
 
 // WithPort returns a copy of Config targeting another remote port.
@@ -138,6 +139,9 @@ func Probe(ctx context.Context, ip net.IP, cfg Config) *result.Result {
 		if throughput > 0 {
 			r.Throughput = throughput
 		}
+		if cfg.EarlyStop && probeOutcomeDecided(r, i+1) {
+			break
+		}
 
 		// Small jitter between tries to avoid looking like a scanner
 		if i < cfg.Tries-1 {
@@ -150,6 +154,26 @@ func Probe(ctx context.Context, ip net.IP, cfg Config) *result.Result {
 	}
 
 	return r
+}
+
+func probeOutcomeDecided(r *result.Result, attempts int) bool {
+	total := len(r.Latencies)
+	if total <= 1 || attempts <= 0 {
+		return true
+	}
+	successes := 0
+	for _, lat := range r.Latencies[:attempts] {
+		if lat > 0 {
+			successes++
+		}
+	}
+	neededSuccesses := total/2 + 1
+	if successes >= neededSuccesses {
+		return true
+	}
+	failures := attempts - successes
+	allowedFailures := total - neededSuccesses
+	return failures > allowedFailures
 }
 
 // probeTCP measures a raw TCP connect time.
@@ -177,22 +201,25 @@ func probeTLS(ctx context.Context, ip net.IP, port int, sni string, timeout time
 	dialCtx, cancel := context.WithDeadline(ctx, dl)
 	defer cancel()
 
-	d := tls.Dialer{
-		NetDialer: &net.Dialer{},
-		Config: &tls.Config{
-			ServerName:         sni,
-			InsecureSkipVerify: insecure,
-			MinVersion:         tls.VersionTLS12,
-		},
-	}
-
 	start := time.Now()
-	conn, err := d.DialContext(dialCtx, "tcp", addr)
+	rawConn, err := (&net.Dialer{Timeout: timeout}).DialContext(dialCtx, "tcp", addr)
 	if err != nil {
 		return 0, false
 	}
+	defer rawConn.Close()
+
+	if err := rawConn.SetDeadline(dl); err != nil {
+		return 0, false
+	}
+	conn := tls.Client(rawConn, &tls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: insecure,
+		MinVersion:         tls.VersionTLS12,
+	})
+	if err := conn.HandshakeContext(dialCtx); err != nil {
+		return 0, false
+	}
 	lat := time.Since(start)
-	conn.Close()
 	return lat, true
 }
 

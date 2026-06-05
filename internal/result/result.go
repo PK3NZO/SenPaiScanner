@@ -10,7 +10,7 @@ import (
 	"github.com/matinsenpai/senpaiscanner/internal/provider"
 )
 
-// Result holds all measured statistics for a single Cloudflare IP.
+// Result holds all measured statistics for a single CDN IP.
 type Result struct {
 	IP           net.IP
 	Port         int

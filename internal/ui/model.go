@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"github.com/matinsenpai/senpaiscanner/internal/banner"
 	"github.com/matinsenpai/senpaiscanner/internal/config"
 	"github.com/matinsenpai/senpaiscanner/internal/debuglog"
+	"github.com/matinsenpai/senpaiscanner/internal/ipsrc"
 	"github.com/matinsenpai/senpaiscanner/internal/provider"
 	"github.com/matinsenpai/senpaiscanner/internal/result"
 	"github.com/matinsenpai/senpaiscanner/internal/runlog"
@@ -228,6 +230,7 @@ type AppModel struct {
 	configScanning      bool
 	configDone          bool
 	configTotal         int
+	configRunID         int64
 	configLogSession    *runlog.Session
 	// config setup options
 	configURL      string
@@ -249,13 +252,14 @@ type AppModel struct {
 	configPortFocus     int
 	configSelectedPorts map[int]bool
 	// phase 1 state
-	configPhase1Results []*result.Result
-	configPhase1Offset  int
-	configPhase1Done    bool
-	configPhase1Only    bool // true when scan stops after Phase 1 (no config URL)
-	configPhase1Stats   StatsMsg
-	configPhase1Total   int // intended IP count for Phase 1 progress display
-	liveResultPath      string
+	configPhase1Results   []*result.Result
+	configPhase1Offset    int
+	configPhase1Done      bool
+	configPhase1Finalized bool
+	configPhase1Only      bool // true when scan stops after Phase 1 (no config URL)
+	configPhase1Stats     StatsMsg
+	configPhase1Total     int // intended IP count for Phase 1 progress display
+	liveResultPath        string
 
 	// shared
 	statusMsg        string
@@ -270,7 +274,7 @@ type menuEntry struct {
 }
 
 var menuEntries = []menuEntry{
-	{"Find Working IPs", "scan Cloudflare IPs — config optional"},
+	{"Find Working IPs", "scan CDN IPs — config optional"},
 	{"Debug Mode", "toggle diagnostic logging and restart"},
 	{"About", ""},
 	{"Quit", ""},
@@ -451,6 +455,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ConfigProgressMsg:
+		if msg.RunID != m.configRunID || m.page != PageConfigPhase2 || (!m.configScanning && !m.configDone) {
+			return m, nil
+		}
 		m.configResults = append(m.configResults, msg.Result)
 		m.configTotal = msg.Total
 		if msg.Result != nil {
@@ -465,12 +472,18 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ConfigDoneMsg:
+		if msg.RunID != m.configRunID || m.page != PageConfigPhase2 || (!m.configScanning && !m.configDone) {
+			return m, nil
+		}
 		m.configScanning = false
 		m.configDone = true
 		debuglog.Printf("config_phase2_done total=%d success=%d fail=%d", len(m.configResults), m.configSuccessCount(), m.configFailCount())
 		return m, nil
 
 	case ConfigPhase1ResultMsg:
+		if msg.RunID != m.configRunID || m.configPhase1Finalized {
+			return m, nil
+		}
 		m.configPhase1Results = append(m.configPhase1Results, msg.Result)
 		if m.configLogSession != nil {
 			if err := m.configLogSession.AppendPhase1Result(msg.Result); err != nil {
@@ -480,6 +493,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ConfigPhase1ErrMsg:
+		if msg.RunID != m.configRunID || m.configPhase1Finalized {
+			return m, nil
+		}
 		m.configScanning = false
 		clearLiveResultWriter()
 		m.page = PageScanWithConfig
@@ -488,50 +504,10 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ConfigPhase1DoneMsg:
-		m.configPhase1Done = true
-		debuglog.Printf("config_phase1_done_ui results=%d healthy=%d phase1_only=%t", len(m.configPhase1Results), len(result.TopN(m.configPhase1Results, 0)), strings.TrimSpace(m.configURL) == "")
-		if strings.TrimSpace(m.configURL) == "" {
-			m.configPhase1Only = true
-			if liveResultWriter != nil {
-				liveResultWriter.FinishPhase1Only()
-			}
+		if msg.RunID != m.configRunID {
 			return m, nil
 		}
-		topN := m.resolveTopN()
-		var topIPs []*result.Result
-		if topN == 0 {
-			topIPs = result.TopN(m.configPhase1Results, 0)
-		} else {
-			topIPs = result.TopN(m.configPhase1Results, topN)
-		}
-		if m.configLogSession != nil {
-			if err := m.configLogSession.WritePhase1Healthy(result.TopN(m.configPhase1Results, 0)); err != nil {
-				m.statusMsg = fmt.Sprintf("results save error: %v", err)
-			}
-			if err := m.configLogSession.WritePhase1Candidates(topIPs); err != nil {
-				m.statusMsg = fmt.Sprintf("results save error: %v", err)
-			}
-		}
-		m.configTotal = len(topIPs)
-		// If Phase 1 found no healthy IPs, stay on the Phase 1 page and show
-		// a clear "no results" message (Phase 2 would have nothing to do).
-		if len(topIPs) == 0 {
-			m.configPhase1Done = true
-			m.page = PageConfigPhase2
-			m.configScanning = false
-			m.configDone = true
-			return m, nil
-		}
-		// Start Phase 2 with top N IPs
-		if liveResultWriter != nil {
-			liveResultWriter.BeginPhase2()
-		}
-		m.page = PageConfigPhase2
-		m.configScanning = true
-		m.configDone = false
-		m.configResults = nil
-		m.configResultsOffset = 0
-		return m, m.startConfigPhase2(topIPs)
+		return m.finishConfigPhase1("done")
 
 	case tea.KeyMsg:
 		debuglog.Printf("key page=%s key=%s", pageName(m.page), safeKeyString(msg))
@@ -675,6 +651,8 @@ func (m AppModel) selectMenuItem() (tea.Model, tea.Cmd) {
 		m.configCustomInput.Blur()
 		m.configURL = ""
 		m.configPhase1Only = false
+		m.configPhase1Finalized = false
+		m.configRunID = 0
 		m.liveResultPath = ""
 		clearLiveResultWriter()
 		m.statusMsg = ""
@@ -1409,8 +1387,12 @@ func (m AppModel) viewProviderSelect() string {
 		line := prefix + style.Render(provider.DisplayName(kind))
 		if kind == provider.Cloudflare {
 			line += "  " + styleDim.Render("full feature set, colo-aware validation")
+		} else if kind == provider.CloudFront {
+			line += "  " + styleDim.Render("AWS edge ranges, config-aware TLS shortlist")
+		} else if kind == provider.Gcore {
+			line += "  " + styleDim.Render("Gcore edge ranges, config-aware TLS shortlist")
 		} else {
-			line += "  " + styleDim.Render("AWS edge ranges, provider-aware HTTP validation")
+			line += "  " + styleDim.Render("Fastly edge ranges, config-aware TLS shortlist")
 		}
 		sb.WriteString("  " + line + "\n")
 	}
@@ -1744,7 +1726,7 @@ func (m AppModel) viewLiveColos() string {
 	sb.WriteString(fmt.Sprintf("%s\n\n", styleSep.Render("  "+strings.Repeat("─", 56))))
 
 	if !m.colosDone {
-		sb.WriteString(fmt.Sprintf("  %s probing %s IPs with provider-aware HTTP validation…\n\n", m.spinner.View(), m.currentProviderName()))
+		sb.WriteString(fmt.Sprintf("  %s probing %s IPs with provider-aware validation…\n\n", m.spinner.View(), m.currentProviderName()))
 	} else {
 		sb.WriteString(styleGood.Render("  ✓ Discovery complete\n\n"))
 	}
@@ -1770,7 +1752,7 @@ func (m AppModel) viewAbout() string {
 	sb.WriteString(styleNormal.Render("  An edge IP scanner built for high-latency, restricted networks."))
 	sb.WriteRune('\n')
 
-	sb.WriteString(styleNormal.Render("  Probes Cloudflare or CloudFront edges via TCP/TLS/HTTP, measures loss,"))
+	sb.WriteString(styleNormal.Render("  Probes CDN edges via TCP/TLS/HTTP, measures loss,"))
 	sb.WriteRune('\n')
 
 	sb.WriteString(styleNormal.Render("  jitter, and surfaces provider-specific validation metadata when available."))
@@ -2274,6 +2256,10 @@ func (m AppModel) handleScanWithConfigKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		if m.configScanning || m.configDone {
+			if m.configScanning && scanCancel != nil {
+				debuglog.Printf("config_phase2_cancel_requested run_id=%d", m.configRunID)
+				scanCancel()
+			}
 			clearLiveResultWriter()
 			m.page = PageHome
 			m.configScanning = false
@@ -2283,6 +2269,17 @@ func (m AppModel) handleScanWithConfigKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.page = PageHome
 		return m, nil
 	case "q":
+		if m.configScanning {
+			if scanCancel != nil {
+				debuglog.Printf("config_phase2_cancel_requested run_id=%d", m.configRunID)
+				scanCancel()
+			}
+			clearLiveResultWriter()
+			m.page = PageHome
+			m.configScanning = false
+			m.configDone = false
+			return m, nil
+		}
 		if m.configDone {
 			m.page = PageHome
 			m.configDone = false
@@ -2606,7 +2603,9 @@ func (m AppModel) launchPhase1FromOptional() (AppModel, tea.Cmd) {
 	m.configPhase1Only = !withConfig
 	m.configPhase1Results = nil
 	m.configPhase1Done = false
+	m.configPhase1Finalized = false
 	m.configPhase1Stats = StatsMsg{}
+	m.configRunID = nextScanID()
 	m.page = PageConfigPhase1
 
 	count := configCountValues[m.configCountIdx]
@@ -2644,7 +2643,7 @@ func (m AppModel) resolveTopN() int {
 }
 
 // ConfigDoneMsg signals all config validations are complete.
-type ConfigDoneMsg struct{}
+type ConfigDoneMsg struct{ RunID int64 }
 
 // ConfigBatchResultMsg is no longer used — results come one by one via ConfigProgressMsg.
 type ConfigBatchResultMsg struct {
@@ -2653,23 +2652,25 @@ type ConfigBatchResultMsg struct {
 
 // ConfigProgressMsg carries a single result during scanning.
 type ConfigProgressMsg struct {
+	RunID  int64
 	Result *xraytest.ValidationResult
 	Done   int
 	Total  int
 }
 
 func (m AppModel) startConfigScan(rawURL string) tea.Cmd {
+	runID := m.configRunID
 	return func() tea.Msg {
-		go runConfigScan(rawURL)
+		go runConfigScan(runID, rawURL)
 		return nil
 	}
 }
 
-func runConfigScan(rawURL string) {
+func runConfigScan(runID int64, rawURL string) {
 	cfg, err := xraytest.ParseProxyURL(rawURL)
 	if err != nil {
 		if prog != nil {
-			prog.Send(ConfigDoneMsg{})
+			prog.Send(ConfigDoneMsg{RunID: runID})
 		}
 		return
 	}
@@ -2690,6 +2691,7 @@ func runConfigScan(rawURL string) {
 		r := xraytest.ValidateConfig(ctx, swapped, 20*time.Second)
 		if prog != nil {
 			prog.Send(ConfigProgressMsg{
+				RunID:  runID,
 				Result: r,
 				Done:   i + 1,
 				Total:  total,
@@ -2698,7 +2700,7 @@ func runConfigScan(rawURL string) {
 	}
 
 	if prog != nil {
-		prog.Send(ConfigDoneMsg{})
+		prog.Send(ConfigDoneMsg{RunID: runID})
 	}
 }
 
@@ -2846,7 +2848,9 @@ func (m AppModel) handleConfigSetupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.page = PageConfigPhase1
 		m.configPhase1Results = nil
 		m.configPhase1Done = false
+		m.configPhase1Finalized = false
 		m.configPhase1Stats = StatsMsg{}
+		m.configRunID = nextScanID()
 		count := configCountValues[m.configCountIdx]
 		if count == 0 {
 			count, _ = strconv.Atoi(m.configCountCustom)
@@ -2854,7 +2858,7 @@ func (m AppModel) handleConfigSetupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				count = 1000
 			}
 		}
-		m.configPhase1Total = count
+		m.configPhase1Total = m.phase1TargetTotal(count)
 		return m, m.startConfigPhase1()
 	}
 	return m, nil
@@ -2865,15 +2869,70 @@ func (m AppModel) handleConfigSetupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // ---------------------------------------------------------------------------
 
 type ConfigPhase1ResultMsg struct {
+	RunID  int64
 	Result *result.Result
 }
 
 // ConfigPhase1ErrMsg is sent when Phase 1 cannot proceed (e.g. ips.txt missing).
-type ConfigPhase1ErrMsg struct{ Err string }
+type ConfigPhase1ErrMsg struct {
+	RunID int64
+	Err   string
+}
 
 type ConfigPhase1StatsMsg = StatsMsg
 
-type ConfigPhase1DoneMsg struct{}
+type ConfigPhase1DoneMsg struct{ RunID int64 }
+
+func (m AppModel) finishConfigPhase1(reason string) (tea.Model, tea.Cmd) {
+	if m.configPhase1Finalized {
+		return m, nil
+	}
+	m.configPhase1Done = true
+	m.configPhase1Finalized = true
+	healthy := result.TopN(m.configPhase1Results, 0)
+	debuglog.Printf("config_phase1_done_ui reason=%s results=%d healthy=%d phase1_only=%t", reason, len(m.configPhase1Results), len(healthy), strings.TrimSpace(m.configURL) == "")
+
+	if strings.TrimSpace(m.configURL) == "" {
+		m.configPhase1Only = true
+		if liveResultWriter != nil {
+			liveResultWriter.FinishPhase1Only()
+		}
+		return m, nil
+	}
+
+	topN := m.resolveTopN()
+	var topIPs []*result.Result
+	if topN == 0 {
+		topIPs = healthy
+	} else {
+		topIPs = result.TopN(m.configPhase1Results, topN)
+	}
+	if m.configLogSession != nil {
+		if err := m.configLogSession.WritePhase1Healthy(healthy); err != nil {
+			m.statusMsg = fmt.Sprintf("results save error: %v", err)
+		}
+		if err := m.configLogSession.WritePhase1Candidates(topIPs); err != nil {
+			m.statusMsg = fmt.Sprintf("results save error: %v", err)
+		}
+	}
+	m.configTotal = m.phase2Total(topIPs)
+	if m.configTotal == 0 {
+		m.page = PageConfigPhase2
+		m.configScanning = false
+		m.configDone = true
+		return m, nil
+	}
+
+	if liveResultWriter != nil {
+		liveResultWriter.BeginPhase2()
+	}
+	m.page = PageConfigPhase2
+	m.configScanning = true
+	m.configDone = false
+	m.configResults = nil
+	m.configResultsOffset = 0
+	return m, m.startConfigPhase2(topIPs)
+}
 
 func (m AppModel) viewConfigPhase1() string {
 	var sb strings.Builder
@@ -2982,8 +3041,16 @@ func (m AppModel) handleConfigPhase1Key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "esc", "q":
 		if scanCancel != nil {
+			debuglog.Printf("config_phase1_cancel_requested run_id=%d", m.configRunID)
 			scanCancel()
 		}
+		if !m.configPhase1Done && strings.TrimSpace(m.configURL) != "" && len(result.TopN(m.configPhase1Results, 0)) > 0 {
+			return m.finishConfigPhase1("cancel")
+		}
+		m.configPhase1Done = true
+		m.configPhase1Finalized = true
+		m.configScanning = false
+		m.configDone = false
 		clearLiveResultWriter()
 		m.page = PageHome
 		return m, nil
@@ -3005,6 +3072,7 @@ func (m AppModel) copyPhase1HealthyEndpoints() string {
 
 // configPhase1Options holds the resolved settings for a Phase 1 engine run.
 type configPhase1Options struct {
+	runID       int64
 	provider    provider.Kind
 	count       int
 	concurrency int
@@ -3088,6 +3156,7 @@ func (m AppModel) resolvePhase1Options() configPhase1Options {
 	}
 
 	return configPhase1Options{
+		runID:       m.configRunID,
 		provider:    m.currentProvider(),
 		count:       count,
 		concurrency: concurrency,
@@ -3109,7 +3178,11 @@ func (m AppModel) phase1TargetTotal(count int) int {
 		}
 		return 0
 	}
-	return count * ports
+	src, err := ipsrc.NewWithOptions(true, false, nil, ipsrc.Options{UseBuiltin: true, Provider: m.currentProvider()})
+	if err != nil {
+		return count * ports
+	}
+	return src.CountUpTo(count) * ports
 }
 
 func (m AppModel) resolveConfigPorts() []int {
@@ -3138,36 +3211,93 @@ func (m AppModel) resolveConfigPorts() []int {
 
 func (m AppModel) startConfigPhase2(topIPs []*result.Result) tea.Cmd {
 	url := m.configURL
+	kind := m.currentProvider()
+	runID := m.configRunID
 	return func() tea.Msg {
-		go runConfigPhase2(url, topIPs)
+		go runConfigPhase2(runID, url, topIPs, kind)
 		return nil
 	}
 }
 
-func runConfigPhase2(rawURL string, topIPs []*result.Result) {
+func (m AppModel) phase2Total(topIPs []*result.Result) int {
+	cfg, err := xraytest.ParseProxyURL(m.configURL)
+	if err != nil {
+		return len(topIPs)
+	}
+	return len(phase2CandidatesForProvider(m.currentProvider(), cfg, topIPs))
+}
+
+func phase2CandidatesForProvider(kind provider.Kind, cfg *xraytest.VLESSConfig, topIPs []*result.Result) []*result.Result {
+	kind = provider.Normalize(string(kind))
+	canary := provider.DiagnosticCanaryIP(kind)
+	if canary == "" || cfg == nil {
+		return topIPs
+	}
+	canaryIP := net.ParseIP(canary)
+	if canaryIP == nil {
+		return topIPs
+	}
+	port := cfg.Port
+	if port <= 0 {
+		port = 443
+	}
+	for _, r := range topIPs {
+		if r != nil && r.Port == port && r.IP.Equal(canaryIP) {
+			return topIPs
+		}
+	}
+	canaryResult := &result.Result{
+		IP:        canaryIP,
+		Port:      port,
+		Provider:  string(kind),
+		ProbeMode: "canary",
+		Timestamp: time.Now(),
+	}
+	candidates := make([]*result.Result, 0, len(topIPs)+1)
+	candidates = append(candidates, canaryResult)
+	candidates = append(candidates, topIPs...)
+	return candidates
+}
+
+func runConfigPhase2(runID int64, rawURL string, topIPs []*result.Result, kind provider.Kind) {
 	defer debuglog.Recover("runConfigPhase2")
 	cfg, err := xraytest.ParseProxyURL(rawURL)
 	if err != nil {
 		if prog != nil {
-			prog.Send(ConfigDoneMsg{})
+			prog.Send(ConfigDoneMsg{RunID: runID})
 		}
 		return
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	scanCancel = cancel
+	defer cancel()
+	topIPs = phase2CandidatesForProvider(kind, cfg, topIPs)
 	total := len(topIPs)
-	debuglog.Printf("config_phase2_start candidates=%d network=%s port=%d sni_set=%t host_set=%t",
-		total, cfg.Network, cfg.Port, cfg.SNI != "", cfg.Host != "")
+	debuglog.Printf("config_phase2_start candidates=%d network=%s mode=%s port=%d path_set=%t sni_set=%t host_set=%t alpn=%d insecure=%t",
+		total, cfg.Network, cfg.Mode, cfg.Port, cfg.Path != "", cfg.SNI != "", cfg.Host != "", len(cfg.ALPN), cfg.Insecure)
 
 	for i, r := range topIPs {
+		if ctx.Err() != nil {
+			debuglog.Printf("config_phase2_cancelled done=%d total=%d", i, total)
+			break
+		}
 		ip := r.IP.String()
 		swapped := cfg.WithEndpoint(ip, r.Port)
 		vr := xraytest.ValidateConfig(ctx, swapped, 20*time.Second)
+		if ctx.Err() != nil {
+			debuglog.Printf("config_phase2_cancelled done=%d total=%d", i, total)
+			break
+		}
+		if canary := provider.DiagnosticCanaryIP(kind); canary != "" && ip == canary {
+			debuglog.Printf("config_phase2_canary_result provider=%s ip=%s port=%d success=%t error=%q", provider.Normalize(string(kind)), ip, r.Port, vr.Success, vr.Error)
+		}
 		if liveResultWriter != nil {
 			liveResultWriter.AddPhase2(vr)
 		}
 		if prog != nil {
 			prog.Send(ConfigProgressMsg{
+				RunID:  runID,
 				Result: vr,
 				Done:   i + 1,
 				Total:  total,
@@ -3176,6 +3306,6 @@ func runConfigPhase2(rawURL string, topIPs []*result.Result) {
 	}
 
 	if prog != nil {
-		prog.Send(ConfigDoneMsg{})
+		prog.Send(ConfigDoneMsg{RunID: runID})
 	}
 }

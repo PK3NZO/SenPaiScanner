@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/matinsenpai/senpaiscanner/internal/result"
 )
 
 func TestNormalizeWSPath(t *testing.T) {
@@ -94,6 +96,33 @@ func TestProbeWebSocketUsesConfiguredHostAndPath(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("server did not receive websocket request")
+	}
+}
+
+func TestProbeOutcomeDecidedAfterMajoritySuccess(t *testing.T) {
+	r := &result.Result{
+		Latencies: []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 0},
+	}
+	if !probeOutcomeDecided(r, 2) {
+		t.Fatal("outcome should be decided after 2 successes out of 3")
+	}
+}
+
+func TestProbeOutcomeDecidedAfterMajorityFailure(t *testing.T) {
+	r := &result.Result{
+		Latencies: []time.Duration{0, 0, 20 * time.Millisecond},
+	}
+	if !probeOutcomeDecided(r, 2) {
+		t.Fatal("outcome should be decided after 2 failures out of 3")
+	}
+}
+
+func TestProbeOutcomeNotDecidedAfterSplitAttempts(t *testing.T) {
+	r := &result.Result{
+		Latencies: []time.Duration{10 * time.Millisecond, 0, 0},
+	}
+	if probeOutcomeDecided(r, 2) {
+		t.Fatal("outcome should not be decided after 1 success and 1 failure out of 3")
 	}
 }
 

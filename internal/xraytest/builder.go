@@ -126,12 +126,8 @@ func buildStreamSettings(cfg *VLESSConfig) map[string]interface{} {
 		ws := map[string]interface{}{
 			"path": cfg.Path,
 		}
-		// xray-core expects headers as a map, not a top-level "host" field.
-		// Using the correct format ensures the Host header reaches the CDN origin.
 		if cfg.Host != "" {
-			ws["headers"] = map[string]interface{}{
-				"Host": cfg.Host,
-			}
+			ws["host"] = cfg.Host
 		}
 		stream["wsSettings"] = ws
 
@@ -152,9 +148,7 @@ func buildStreamSettings(cfg *VLESSConfig) map[string]interface{} {
 			"path": cfg.Path,
 		}
 		if cfg.Host != "" {
-			xhttp["headers"] = map[string]interface{}{
-				"Host": cfg.Host,
-			}
+			xhttp["host"] = cfg.Host
 		}
 		if cfg.Mode != "" {
 			xhttp["mode"] = cfg.Mode

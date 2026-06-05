@@ -29,6 +29,12 @@ var builtinCloudFrontV4 string
 //go:embed ranges_cloudfront_v6.txt
 var builtinCloudFrontV6 string
 
+//go:embed ranges_gcore_v4.txt
+var builtinGcoreV4 string
+
+//go:embed ranges_fastly_v4.txt
+var builtinFastlyV4 string
+
 const (
 	cfIPsV4URL = "https://www.cloudflare.com/ips-v4/"
 	cfIPsV6URL = "https://www.cloudflare.com/ips-v6/"
@@ -43,16 +49,16 @@ type Source struct {
 
 // Options controls how a Source is built.
 type Options struct {
-	// UseBuiltin controls whether embedded Cloudflare ranges are loaded before
+	// UseBuiltin controls whether embedded provider ranges are loaded before
 	// any extra CIDRs are added. Set it to false when user-provided CIDRs should
-	// be treated as an exact scan scope rather than as additions to Cloudflare's
+	// be treated as an exact scan scope rather than as additions to the provider's
 	// full published ranges.
 	UseBuiltin bool
 	// Provider selects which embedded range set to use.
 	Provider provider.Kind
 }
 
-// New builds a Source from the embedded Cloudflare ranges plus optional extra
+// New builds a Source from the embedded provider ranges plus optional extra
 // CIDRs.
 func New(useV4, useV6 bool, extra []string) (*Source, error) {
 	return NewWithOptions(useV4, useV6, extra, Options{UseBuiltin: true})
@@ -104,10 +110,24 @@ func (s *Source) IPv4Nets() []*net.IPNet {
 	return s.v4Nets
 }
 
+// CountUpTo returns the number of unique addresses available up to limit.
+// If the source has more than limit addresses, limit is returned.
+func (s *Source) CountUpTo(limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	if ips, ok := s.enumerateIfAtMost(limit); ok {
+		return len(ips)
+	}
+	return limit
+}
+
 // Random returns a single random IP from the configured ranges.
 func (s *Source) Random() net.IP {
-	all := append(s.v4Nets, s.v6Nets...)
-	target := all[s.rng.Intn(len(all))]
+	target := s.weightedRandomNet()
+	if target == nil {
+		return nil
+	}
 	return randomFromNet(target, s.rng)
 }
 
@@ -115,13 +135,28 @@ func (s *Source) Random() net.IP {
 // count IPs have been sent (count <= 0 means unlimited).
 //
 // Each IP is emitted at most once per call: duplicates are silently skipped.
-// For very large counts relative to the available address space the loop may
-// spin for longer, but Cloudflare's published ranges are large enough that
-// this is not a practical concern for the scan sizes the TUI exposes.
+// If the requested count is larger than a finite embedded range set, Stream
+// emits every available address once and then closes.
 func (s *Source) Stream(ctx context.Context, count int) <-chan net.IP {
 	ch := make(chan net.IP, 64)
 	go func() {
 		defer close(ch)
+		if count > 0 {
+			if ips, ok := s.enumerateIfAtMost(count); ok {
+				s.rng.Shuffle(len(ips), func(i, j int) {
+					ips[i], ips[j] = ips[j], ips[i]
+				})
+				for _, ip := range ips {
+					select {
+					case <-ctx.Done():
+						return
+					case ch <- ip:
+					}
+				}
+				return
+			}
+		}
+
 		seen := make(map[string]struct{})
 		sent := 0
 		for {
@@ -239,10 +274,137 @@ func parseLines(raw string) ([]*net.IPNet, error) {
 	return nets, sc.Err()
 }
 
+func (s *Source) enumerateIfAtMost(limit int) ([]net.IP, bool) {
+	if limit <= 0 {
+		return nil, false
+	}
+	all := append([]*net.IPNet{}, s.v4Nets...)
+	all = append(all, s.v6Nets...)
+
+	var ips []net.IP
+	seen := make(map[string]struct{})
+	for _, n := range all {
+		ones, bits := n.Mask.Size()
+		if ones < 0 || bits < 0 {
+			return nil, false
+		}
+		hostBits := bits - ones
+		if hostBits >= 31 {
+			return nil, false
+		}
+		size := 1 << uint(hostBits)
+		if len(ips)+size > limit {
+			return nil, false
+		}
+		for ip := cloneIP(n.IP); n.Contains(ip); incrementIP(ip) {
+			key := ip.String()
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			ips = append(ips, cloneIP(ip))
+		}
+	}
+	return ips, true
+}
+
+func (s *Source) weightedRandomNet() *net.IPNet {
+	if len(s.v4Nets)+len(s.v6Nets) == 0 {
+		return nil
+	}
+
+	var total uint64
+	weights := make([]uint64, len(s.v4Nets)+len(s.v6Nets))
+	for i, n := range s.v4Nets {
+		weight := netAddressCount(n)
+		if weight == 0 {
+			continue
+		}
+		if total > ^uint64(0)-weight {
+			weight = ^uint64(0) - total
+		}
+		weights[i] = weight
+		total += weight
+		if total == ^uint64(0) {
+			break
+		}
+	}
+	if total != ^uint64(0) {
+		offset := len(s.v4Nets)
+		for i, n := range s.v6Nets {
+			weight := netAddressCount(n)
+			if weight == 0 {
+				continue
+			}
+			if total > ^uint64(0)-weight {
+				weight = ^uint64(0) - total
+			}
+			weights[offset+i] = weight
+			total += weight
+			if total == ^uint64(0) {
+				break
+			}
+		}
+	}
+	if total == 0 {
+		if len(s.v4Nets) > 0 {
+			return s.v4Nets[s.rng.Intn(len(s.v4Nets))]
+		}
+		return s.v6Nets[s.rng.Intn(len(s.v6Nets))]
+	}
+
+	choice := randomUint64Below(s.rng, total)
+	for i, weight := range weights {
+		if weight == 0 {
+			continue
+		}
+		if choice < weight {
+			if i < len(s.v4Nets) {
+				return s.v4Nets[i]
+			}
+			return s.v6Nets[i-len(s.v4Nets)]
+		}
+		choice -= weight
+	}
+	if len(s.v6Nets) > 0 {
+		return s.v6Nets[len(s.v6Nets)-1]
+	}
+	return s.v4Nets[len(s.v4Nets)-1]
+}
+
+func netAddressCount(n *net.IPNet) uint64 {
+	ones, bits := n.Mask.Size()
+	if ones < 0 || bits < 0 {
+		return 0
+	}
+	hostBits := bits - ones
+	if hostBits >= 63 {
+		return ^uint64(0)
+	}
+	return uint64(1) << uint(hostBits)
+}
+
+func randomUint64Below(rng *rand.Rand, limit uint64) uint64 {
+	if limit <= 1 {
+		return 0
+	}
+	threshold := -limit % limit
+	for {
+		v := rng.Uint64()
+		if v >= threshold {
+			return v % limit
+		}
+	}
+}
+
 func builtinRangesV4(kind provider.Kind) string {
 	switch provider.Normalize(string(kind)) {
 	case provider.CloudFront:
 		return builtinCloudFrontV4
+	case provider.Gcore:
+		return builtinGcoreV4
+	case provider.Fastly:
+		return builtinFastlyV4
 	default:
 		return builtinV4
 	}

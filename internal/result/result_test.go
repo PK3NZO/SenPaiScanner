@@ -125,6 +125,30 @@ func TestHTTPHealthSupportsCloudFrontValidation(t *testing.T) {
 	}
 }
 
+func TestHTTPHealthSupportsGcoreValidation(t *testing.T) {
+	r := makeResult([]time.Duration{80 * time.Millisecond, 90 * time.Millisecond})
+	r.Provider = "gcore"
+	r.ProbeMode = "http"
+	r.HTTPStatus = 200
+	r.TLSOk = true
+	r.VerifiedHTTP = true
+	if !r.IsHealthy() {
+		t.Fatal("expected verified Gcore HTTP result to be healthy without colo")
+	}
+}
+
+func TestHTTPHealthSupportsFastlyValidation(t *testing.T) {
+	r := makeResult([]time.Duration{80 * time.Millisecond, 90 * time.Millisecond})
+	r.Provider = "fastly"
+	r.ProbeMode = "http"
+	r.HTTPStatus = 200
+	r.TLSOk = true
+	r.VerifiedHTTP = true
+	if !r.IsHealthy() {
+		t.Fatal("expected verified Fastly HTTP result to be healthy without colo")
+	}
+}
+
 func TestHTTPHealthRequiresTLSOnNonPlainHTTPPorts(t *testing.T) {
 	r := makeResult([]time.Duration{100 * time.Millisecond})
 	r.Provider = "cloudflare"

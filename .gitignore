@@ -56,6 +56,9 @@ results/
 *.csv
 *.json
 !testdata/**/*.json
+!internal/ipsrc/gcore.json
+!internal/ipsrc/fastly.json
+ips.txt
 
 # Environment / secrets
 .env

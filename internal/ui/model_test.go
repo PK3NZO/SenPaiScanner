@@ -12,6 +12,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/matinsenpai/senpaiscanner/internal/provider"
 	"github.com/matinsenpai/senpaiscanner/internal/result"
 	"github.com/matinsenpai/senpaiscanner/internal/xraytest"
 )
@@ -125,6 +126,26 @@ func TestResolvePhase1OptionsFromFile(t *testing.T) {
 	}
 }
 
+func TestPhase1TargetTotalUsesProviderCapacity(t *testing.T) {
+	m := NewApp("test")
+	m.applySelectedProvider(provider.Gcore)
+	m.configSelectedPorts = map[int]bool{443: true}
+
+	if got := m.phase1TargetTotal(1000); got != 978 {
+		t.Fatalf("phase1 target = %d, want 978", got)
+	}
+}
+
+func TestPhase1TargetTotalUsesFastlyRequestedCount(t *testing.T) {
+	m := NewApp("test")
+	m.applySelectedProvider(provider.Fastly)
+	m.configSelectedPorts = map[int]bool{443: true}
+
+	if got := m.phase1TargetTotal(1000); got != 1000 {
+		t.Fatalf("phase1 target = %d, want 1000", got)
+	}
+}
+
 func TestResolveConfigPortsMultiSelect(t *testing.T) {
 	m := NewApp("test")
 	m.configURL = "vless://12345678-1234-1234-1234-123456789abc@example.com:443?encryption=none&security=tls&type=ws&host=example.com&path=%2F#test"
@@ -138,6 +159,212 @@ func TestResolveConfigPortsMultiSelect(t *testing.T) {
 	}
 	if strings.Join(parts, ",") != strings.Join(want, ",") {
 		t.Fatalf("ports = %v, want %v", got, want)
+	}
+}
+
+func TestConfigPhase1EscWithHealthyConfigStartsPhase2(t *testing.T) {
+	m := NewApp("test")
+	m.page = PageConfigPhase1
+	m.configRunID = 42
+	m.configURL = "vless://12345678-1234-1234-1234-123456789abc@example.com:443?encryption=none&security=tls&type=ws&host=example.com&path=%2F#test"
+	m.configPhase1Results = []*result.Result{
+		{
+			IP:           net.ParseIP("92.223.124.41"),
+			Port:         443,
+			Provider:     "gcore",
+			ProbeMode:    "http",
+			Latencies:    []time.Duration{100 * time.Millisecond},
+			TLSOk:        true,
+			HTTPStatus:   200,
+			VerifiedHTTP: true,
+		},
+	}
+
+	next, cmd := m.handleConfigPhase1Key(tea.KeyMsg{Type: tea.KeyEsc})
+	got := next.(AppModel)
+	if got.page != PageConfigPhase2 {
+		t.Fatalf("page = %v, want PageConfigPhase2", got.page)
+	}
+	if !got.configScanning || got.configDone {
+		t.Fatalf("configScanning/configDone = %t/%t, want true/false", got.configScanning, got.configDone)
+	}
+	if got.configTotal != 1 {
+		t.Fatalf("configTotal = %d, want 1", got.configTotal)
+	}
+	if !got.configPhase1Finalized {
+		t.Fatal("configPhase1Finalized = false, want true")
+	}
+	if cmd == nil {
+		t.Fatal("expected Phase 2 command")
+	}
+}
+
+func TestConfigPhase1EscWithoutHealthyIgnoresLateDone(t *testing.T) {
+	m := NewApp("test")
+	m.page = PageConfigPhase1
+	m.configRunID = 99
+	m.configURL = "vless://12345678-1234-1234-1234-123456789abc@example.com:443?encryption=none&security=tls&type=xhttp&host=example.com&path=%2F#test"
+
+	next, cmd := m.handleConfigPhase1Key(tea.KeyMsg{Type: tea.KeyEsc})
+	got := next.(AppModel)
+	if cmd != nil {
+		t.Fatal("cmd != nil, want nil")
+	}
+	if got.page != PageHome {
+		t.Fatalf("page = %v, want PageHome", got.page)
+	}
+	if !got.configPhase1Finalized {
+		t.Fatal("configPhase1Finalized = false, want true")
+	}
+
+	next, cmd = got.Update(ConfigPhase1DoneMsg{RunID: 99})
+	got = next.(AppModel)
+	if cmd != nil {
+		t.Fatal("late done cmd != nil, want nil")
+	}
+	if got.page != PageHome {
+		t.Fatalf("late done page = %v, want PageHome", got.page)
+	}
+	if got.configScanning || got.configDone {
+		t.Fatalf("configScanning/configDone = %t/%t, want false/false", got.configScanning, got.configDone)
+	}
+}
+
+func TestConfigPhase2EscIgnoresLateProgressAndDone(t *testing.T) {
+	m := NewApp("test")
+	m.page = PageConfigPhase2
+	m.configRunID = 7
+	m.configScanning = true
+	m.configTotal = 50
+
+	next, cmd := m.handleScanWithConfigKey(tea.KeyMsg{Type: tea.KeyEsc})
+	got := next.(AppModel)
+	if cmd != nil {
+		t.Fatal("cmd != nil, want nil")
+	}
+	if got.page != PageHome {
+		t.Fatalf("page = %v, want PageHome", got.page)
+	}
+	if got.configScanning || got.configDone {
+		t.Fatalf("configScanning/configDone = %t/%t, want false/false", got.configScanning, got.configDone)
+	}
+
+	next, _ = got.Update(ConfigProgressMsg{
+		RunID:  7,
+		Result: &xraytest.ValidationResult{Success: true},
+		Done:   1,
+		Total:  50,
+	})
+	got = next.(AppModel)
+	if len(got.configResults) != 0 {
+		t.Fatalf("late progress appended %d results, want 0", len(got.configResults))
+	}
+
+	next, _ = got.Update(ConfigDoneMsg{RunID: 7})
+	got = next.(AppModel)
+	if got.configDone {
+		t.Fatal("late done set configDone=true, want false")
+	}
+}
+
+func TestFastlyConfigPhase1DoneWithNoHealthyStillStartsCanaryPhase2(t *testing.T) {
+	m := NewApp("test")
+	m.applySelectedProvider(provider.Fastly)
+	m.page = PageConfigPhase1
+	m.configURL = "vless://12345678-1234-1234-1234-123456789abc@example.com:443?encryption=none&security=tls&type=xhttp&host=example.com&path=%2F#test"
+
+	next, cmd := m.finishConfigPhase1("done")
+	got := next.(AppModel)
+	if got.page != PageConfigPhase2 {
+		t.Fatalf("page = %v, want PageConfigPhase2", got.page)
+	}
+	if !got.configScanning || got.configDone {
+		t.Fatalf("configScanning/configDone = %t/%t, want true/false", got.configScanning, got.configDone)
+	}
+	if got.configTotal != 1 {
+		t.Fatalf("configTotal = %d, want 1 canary candidate", got.configTotal)
+	}
+	if cmd == nil {
+		t.Fatal("expected Phase 2 command")
+	}
+}
+
+func TestPhase2CandidatesForGcorePrependsCanary(t *testing.T) {
+	cfg := &xraytest.VLESSConfig{Port: 443}
+	topIPs := []*result.Result{
+		{IP: net.ParseIP("92.223.124.41"), Port: 443, Provider: "gcore"},
+	}
+
+	got := phase2CandidatesForProvider(provider.Gcore, cfg, topIPs)
+	if len(got) != 2 {
+		t.Fatalf("candidates = %d, want 2", len(got))
+	}
+	wantCanary := provider.DiagnosticCanaryIP(provider.Gcore)
+	if got[0].IP.String() != wantCanary || got[0].Port != 443 {
+		t.Fatalf("first candidate = %s:%d, want %s:443", got[0].IP, got[0].Port, wantCanary)
+	}
+	if got[1] != topIPs[0] {
+		t.Fatal("original candidate was not preserved after canary")
+	}
+}
+
+func TestPhase2CandidatesForGcoreDoesNotDuplicateCanary(t *testing.T) {
+	cfg := &xraytest.VLESSConfig{Port: 443}
+	topIPs := []*result.Result{
+		{IP: net.ParseIP(provider.DiagnosticCanaryIP(provider.Gcore)), Port: 443, Provider: "gcore"},
+	}
+
+	got := phase2CandidatesForProvider(provider.Gcore, cfg, topIPs)
+	if len(got) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(got))
+	}
+	if got[0] != topIPs[0] {
+		t.Fatal("existing canary candidate should be reused")
+	}
+}
+
+func TestPhase2CandidatesForFastlyPrependsCanary(t *testing.T) {
+	cfg := &xraytest.VLESSConfig{Port: 443}
+	topIPs := []*result.Result{
+		{IP: net.ParseIP("151.101.1.1"), Port: 443, Provider: "fastly"},
+	}
+
+	got := phase2CandidatesForProvider(provider.Fastly, cfg, topIPs)
+	if len(got) != 2 {
+		t.Fatalf("candidates = %d, want 2", len(got))
+	}
+	wantCanary := provider.DiagnosticCanaryIP(provider.Fastly)
+	if got[0].IP.String() != wantCanary || got[0].Port != 443 {
+		t.Fatalf("first candidate = %s:%d, want %s:443", got[0].IP, got[0].Port, wantCanary)
+	}
+	if got[1] != topIPs[0] {
+		t.Fatal("original candidate was not preserved after canary")
+	}
+}
+
+func TestPhase2CandidatesForFastlyCanRunWithNoHealthyIPs(t *testing.T) {
+	cfg := &xraytest.VLESSConfig{Port: 443}
+	got := phase2CandidatesForProvider(provider.Fastly, cfg, nil)
+	if len(got) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(got))
+	}
+	if got[0].IP.String() != provider.DiagnosticCanaryIP(provider.Fastly) {
+		t.Fatalf("candidate = %s, want Fastly canary", got[0].IP)
+	}
+}
+
+func TestPhase2CandidatesForCloudFrontDoesNotAddGcoreCanary(t *testing.T) {
+	cfg := &xraytest.VLESSConfig{Port: 443}
+	topIPs := []*result.Result{
+		{IP: net.ParseIP("13.32.0.1"), Port: 443, Provider: "cloudfront"},
+	}
+
+	got := phase2CandidatesForProvider(provider.CloudFront, cfg, topIPs)
+	if len(got) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(got))
+	}
+	if got[0] != topIPs[0] {
+		t.Fatal("cloudfront candidates should be unchanged")
 	}
 }
 

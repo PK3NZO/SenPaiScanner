@@ -302,11 +302,13 @@ func runConfigPhase1(opts configPhase1Options) {
 		probeCfg, err = configProbeFromURL(opts.rawURL, opts.timeout, opts.provider)
 		if err != nil {
 			if prog != nil {
-				prog.Send(ConfigPhase1ErrMsg{Err: fmt.Sprintf("invalid URL: %v", err)})
+				prog.Send(ConfigPhase1ErrMsg{RunID: opts.runID, Err: fmt.Sprintf("invalid URL: %v", err)})
 			}
 			return
 		}
 	}
+	debuglog.Printf("config_phase1_probe_config provider=%s mode=%s tries=%d timeout=%s sni_set=%t insecure=%t early_stop=%t",
+		opts.provider, probeCfg.Mode, probeCfg.Tries, probeCfg.Timeout, probeCfg.SNI != "", probeCfg.InsecureSkipVerify, probeCfg.EarlyStop)
 	ports := opts.ports
 	if len(ports) == 0 {
 		ports = []int{probeCfg.Port}
@@ -323,7 +325,7 @@ func runConfigPhase1(opts configPhase1Options) {
 			liveResultWriter.AddPhase1(r)
 		}
 		if prog != nil {
-			prog.Send(ConfigPhase1ResultMsg{Result: r})
+			prog.Send(ConfigPhase1ResultMsg{RunID: opts.runID, Result: r})
 		}
 	}
 
@@ -333,13 +335,13 @@ func runConfigPhase1(opts configPhase1Options) {
 		ips, err := loadDefaultIPsFile()
 		if err != nil {
 			if prog != nil {
-				prog.Send(ConfigPhase1ErrMsg{Err: err.Error()})
+				prog.Send(ConfigPhase1ErrMsg{RunID: opts.runID, Err: err.Error()})
 			}
 			return
 		}
 		if len(ips) == 0 {
 			if prog != nil {
-				prog.Send(ConfigPhase1ErrMsg{Err: "ips.txt is empty — add one IP per line"})
+				prog.Send(ConfigPhase1ErrMsg{RunID: opts.runID, Err: "ips.txt is empty — add one IP per line"})
 			}
 			return
 		}
@@ -353,11 +355,12 @@ func runConfigPhase1(opts configPhase1Options) {
 		src, err := ipsrc.NewWithOptions(true, false, nil, ipsrc.Options{UseBuiltin: true, Provider: opts.provider})
 		if err != nil {
 			if prog != nil {
-				prog.Send(ConfigPhase1DoneMsg{})
+				prog.Send(ConfigPhase1DoneMsg{RunID: opts.runID})
 			}
 			return
 		}
 		ipStream = src.Stream(ctx, opts.count)
+		ipStream = prependProviderCanary(ctx, opts.provider, ipStream)
 		neighbor = neighborScanOpts{
 			enabled:  true,
 			nets:     src.IPv4Nets(),
@@ -373,14 +376,57 @@ func runConfigPhase1(opts configPhase1Options) {
 	runConfigPortProbes(ctx, ipStream, ports, opts.concurrency, probeCfg, callback, neighbor, maxProbes)
 
 	if prog != nil {
-		prog.Send(ConfigPhase1DoneMsg{})
+		prog.Send(ConfigPhase1DoneMsg{RunID: opts.runID})
 	}
 	debuglog.Printf("config_phase1_done provider=%s", opts.provider)
+}
+
+func prependProviderCanary(ctx context.Context, kind provider.Kind, ips <-chan net.IP) <-chan net.IP {
+	if provider.Normalize(string(kind)) != provider.Fastly {
+		return ips
+	}
+	canary := provider.DiagnosticCanaryIP(kind)
+	if canary == "" {
+		return ips
+	}
+	canaryIP := net.ParseIP(canary)
+	if canaryIP == nil {
+		return ips
+	}
+	debuglog.Printf("config_phase1_canary_enqueue provider=%s ip=%s", provider.Normalize(string(kind)), canary)
+	ch := make(chan net.IP, 64)
+	go func() {
+		defer close(ch)
+		sentCanary := false
+		select {
+		case <-ctx.Done():
+			return
+		case ch <- canaryIP:
+			sentCanary = true
+		}
+		for ip := range ips {
+			if sentCanary && ip.Equal(canaryIP) {
+				continue
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- ip:
+			}
+		}
+	}()
+	return ch
 }
 
 type configProbeJob struct {
 	ip   net.IP
 	port int
+}
+
+type activeConfigProbe struct {
+	ip    net.IP
+	port  int
+	start time.Time
 }
 
 type neighborScanOpts struct {
@@ -409,10 +455,14 @@ func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, co
 
 	jobs := make(chan configProbeJob, concurrency*2)
 	var pending int64
+	var completed int64
 	var neighborsQueued int64
+	var inputDone atomic.Bool
 	seen := make(map[string]struct{})
 	submitted := 0
 	var seenMu sync.Mutex
+	active := make(map[int]activeConfigProbe)
+	var activeMu sync.Mutex
 
 	jobKey := func(ip net.IP, port int) string {
 		return fmt.Sprintf("%s:%d", ip.String(), port)
@@ -427,7 +477,21 @@ func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, co
 		return submitted >= maxProbes
 	}
 
-	submit := func(ip net.IP, port int) bool {
+	submittedCount := func() int {
+		seenMu.Lock()
+		defer seenMu.Unlock()
+		return submitted
+	}
+
+	rollbackSubmit := func(key string) {
+		seenMu.Lock()
+		delete(seen, key)
+		submitted--
+		seenMu.Unlock()
+		atomic.AddInt64(&pending, -1)
+	}
+
+	submit := func(ip net.IP, port int, block bool) bool {
 		key := jobKey(ip, port)
 		seenMu.Lock()
 		if _, ok := seen[key]; ok {
@@ -443,9 +507,21 @@ func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, co
 		seenMu.Unlock()
 
 		atomic.AddInt64(&pending, 1)
+		if !block {
+			select {
+			case <-ctx.Done():
+				rollbackSubmit(key)
+				return false
+			case jobs <- configProbeJob{ip: ip, port: port}:
+				return true
+			default:
+				rollbackSubmit(key)
+				return false
+			}
+		}
 		select {
 		case <-ctx.Done():
-			atomic.AddInt64(&pending, -1)
+			rollbackSubmit(key)
 			return false
 		case jobs <- configProbeJob{ip: ip, port: port}:
 			return true
@@ -454,7 +530,7 @@ func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, co
 
 	enqueueIP := func(ip net.IP) {
 		for _, port := range ports {
-			submit(ip, port)
+			submit(ip, port, true)
 		}
 	}
 
@@ -478,7 +554,7 @@ func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, co
 			}
 			added := 0
 			for _, port := range ports {
-				if submit(nip, port) {
+				if submit(nip, port, false) {
 					added++
 				}
 			}
@@ -490,24 +566,78 @@ func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, co
 
 	var wg sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
+		workerID := i
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
 				if ctx.Err() != nil {
 					atomic.AddInt64(&pending, -1)
+					atomic.AddInt64(&completed, 1)
 					continue
 				}
+				activeMu.Lock()
+				active[workerID] = activeConfigProbe{ip: job.ip, port: job.port, start: time.Now()}
+				activeMu.Unlock()
+				started := time.Now()
 				r := prober.Probe(ctx, job.ip, base.WithPort(job.port))
+				elapsed := time.Since(started)
+				activeMu.Lock()
+				delete(active, workerID)
+				activeMu.Unlock()
+				if ctx.Err() != nil {
+					atomic.AddInt64(&pending, -1)
+					atomic.AddInt64(&completed, 1)
+					continue
+				}
+				if elapsed > base.Timeout+500*time.Millisecond {
+					debuglog.Printf("config_phase1_probe_slow endpoint=%s mode=%s duration=%s timeout=%s healthy=%t",
+						formatEndpoint(job.ip.String(), job.port), base.Mode, elapsed.Round(time.Millisecond), base.Timeout, r.IsHealthy())
+				}
 				maybeEnqueueNeighbors(r)
 				callback(r)
 				atomic.AddInt64(&pending, -1)
+				atomic.AddInt64(&completed, 1)
 			}
 		}()
 	}
 
+	stopStats := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				debuglog.Printf("config_phase1_probe_stats event=ctx_done submitted=%d completed=%d pending=%d queue=%d neighbors=%d input_done=%t",
+					submittedCount(), atomic.LoadInt64(&completed), atomic.LoadInt64(&pending), len(jobs), atomic.LoadInt64(&neighborsQueued), inputDone.Load())
+				return
+			case <-stopStats:
+				return
+			case <-ticker.C:
+				now := time.Now()
+				var slow []string
+				activeMu.Lock()
+				for _, p := range active {
+					age := now.Sub(p.start)
+					if age > base.Timeout+500*time.Millisecond {
+						slow = append(slow, fmt.Sprintf("%s@%s", formatEndpoint(p.ip.String(), p.port), age.Round(time.Millisecond)))
+						if len(slow) >= 12 {
+							break
+						}
+					}
+				}
+				activeCount := len(active)
+				activeMu.Unlock()
+				debuglog.Printf("config_phase1_probe_stats submitted=%d completed=%d pending=%d active=%d queue=%d neighbors=%d input_done=%t slow=%q",
+					submittedCount(), atomic.LoadInt64(&completed), atomic.LoadInt64(&pending), activeCount, len(jobs), atomic.LoadInt64(&neighborsQueued), inputDone.Load(), strings.Join(slow, ","))
+			}
+		}
+	}()
+
 	go func() {
 		defer func() {
+			inputDone.Store(true)
 			for atomic.LoadInt64(&pending) > 0 {
 				time.Sleep(20 * time.Millisecond)
 			}
@@ -526,17 +656,30 @@ func runConfigPortProbes(ctx context.Context, ips <-chan net.IP, ports []int, co
 	}()
 
 	wg.Wait()
+	close(stopStats)
+	debuglog.Printf("config_phase1_probe_complete submitted=%d completed=%d pending=%d neighbors=%d input_done=%t",
+		submittedCount(), atomic.LoadInt64(&completed), atomic.LoadInt64(&pending), atomic.LoadInt64(&neighborsQueued), inputDone.Load())
 }
 
 func defaultPhase1ProbeConfig(timeout time.Duration, kind provider.Kind) prober.Config {
+	mode := prober.ModeHTTP
+	speedBytes := speedSampleForMode(kind, prober.ModeHTTP)
+	insecure := false
+	if provider.Normalize(string(kind)) == provider.Fastly {
+		mode = prober.ModeTLS
+		speedBytes = 0
+		insecure = true
+	}
 	return prober.Config{
-		Port:       443,
-		Provider:   kind,
-		Mode:       prober.ModeHTTP,
-		Tries:      3,
-		Timeout:    timeout,
-		SNI:        provider.DefaultHTTPHost(kind),
-		SpeedBytes: speedSampleForMode(kind, prober.ModeHTTP),
+		Port:               443,
+		Provider:           kind,
+		Mode:               mode,
+		Tries:              3,
+		Timeout:            timeout,
+		SNI:                provider.DefaultHTTPHost(kind),
+		SpeedBytes:         speedBytes,
+		InsecureSkipVerify: insecure,
+		EarlyStop:          true,
 	}
 }
 
@@ -571,6 +714,31 @@ func configProbeFromURL(rawURL string, timeout time.Duration, kind provider.Kind
 		return prober.Config{}, err
 	}
 
+	switch provider.Normalize(string(kind)) {
+	case provider.CloudFront, provider.Gcore, provider.Fastly:
+		// Shared CDN edges are distribution/config specific. Provider-owned
+		// list endpoints can reject otherwise usable edges, so config mode uses
+		// a TLS reachability shortlist and lets Phase 2 validate the exact xray
+		// config end-to-end.
+		sni := cfg.SNI
+		if sni == "" {
+			sni = cfg.Host
+		}
+		if sni == "" {
+			sni = provider.DefaultHTTPHost(kind)
+		}
+		return prober.Config{
+			Port:               cfg.Port,
+			Provider:           kind,
+			Mode:               prober.ModeTLS,
+			Tries:              1,
+			Timeout:            timeout,
+			SNI:                sni,
+			InsecureSkipVerify: true,
+			EarlyStop:          true,
+		}, nil
+	}
+
 	sni := cfg.SNI
 	if sni == "" {
 		sni = cfg.Host
@@ -584,14 +752,7 @@ func configProbeFromURL(rawURL string, timeout time.Duration, kind provider.Kind
 		Timeout:            timeout,
 		SNI:                sni,
 		InsecureSkipVerify: true,
-	}
-	if provider.Normalize(string(kind)) == provider.CloudFront {
-		if cfg.Security == "none" || cfg.Port == 80 {
-			probeCfg.Mode = prober.ModeTCP
-		} else {
-			probeCfg.Mode = prober.ModeTLS
-		}
-		return probeCfg, nil
+		EarlyStop:          true,
 	}
 	if cfg.Network == "ws" {
 		probeCfg.WebSocketHost = cfg.Host
